@@ -31,7 +31,7 @@ from .bands import BAND_CENTRES
 from .rir import Path, Tail
 from .scene import Coupling, Room, Scene
 from ..acoustics import atmosphere, diffraction as diffr, ground as gnd
-from ..acoustics import image_source, transmission
+from ..acoustics import image_source, rooms as room_acoustics, transmission
 from ..acoustics.constants import speed_of_sound
 from ..acoustics.materials import absorber, panel as get_panel
 
@@ -149,7 +149,16 @@ class PathBuilder:
         # relation applied at the element's distance.
         ratio = 16.0 * np.pi * d_dir**2 / np.maximum(A, 1e-6)
         e_early = np.sum(np.abs(np.array([p.gains for p in paths])) ** 2, axis=0)
-        e_tail = np.maximum(e_dir * ratio - e_early, 0.0)
+        # A diffuse field needs a dense forest of resonances to exist in.  Weyl's
+        # count says a 1/3-octave band holds ~4 pi V f^2 df / c^3 modes; below
+        # roughly one mode per band the *build-up* cannot reach the diffuse value,
+        # and since A also shrinks with frequency an uncorrected tail dumps an
+        # enormous amount of sub-60 Hz energy into the output -- inaudible, but
+        # enough to pump a cone and make the limiter buzz.  The geometric early
+        # reflections are left alone: they are the deterministic field.
+        weight = room_acoustics.mode_count_weight(self.bands, room.volume,
+                                         self.scene.weather.temp_c)
+        e_tail = np.maximum((e_dir * ratio - e_early) * weight, 0.0)
         t60 = 0.161 * room.volume / np.maximum(A, 1e-6)
         onset = max(p.delay_s for p in paths) if paths else 0.0
         return Tail(energy=e_tail, t60=t60, onset_s=onset)
@@ -248,7 +257,12 @@ class PathBuilder:
                 inc, self.bands, p, temp_c=self.scene.weather.temp_c)
             tl = -10.0 * np.log10(np.clip(tau, 1e-12, 1.0))
         tau_lin = 10.0 ** (-tl / 10.0)
-        return np.sqrt(tau_lin * elem.area_m2 / (2.0 * np.pi))
+        # the plate's transmission loss is referenced to an infinite baffle; the
+        # real element is finite, and below ka ~ 1 it cannot radiate what it
+        # transmits, so the re-radiated power carries the piston efficiency too
+        sig = transmission.radiation_efficiency(self.bands, elem.area_m2,
+                                                self.scene.weather.temp_c)
+        return np.sqrt(tau_lin * sig * elem.area_m2 / (2.0 * np.pi))
 
     def element_gain_diffuse(self, elem: Coupling) -> np.ndarray:
         """Same, for an element driven by a reverberant (diffuse) field.
@@ -272,7 +286,9 @@ class PathBuilder:
             tl = transmission.transmission_loss_db(self.bands, p, field_incidence=True,
                                                    temp_c=self.scene.weather.temp_c)
         tau_lin = 10.0 ** (-tl / 10.0)
-        return np.sqrt(tau_lin * elem.area_m2 / (2.0 * np.pi))
+        sig = transmission.radiation_efficiency(self.bands, elem.area_m2,
+                                                self.scene.weather.temp_c)
+        return np.sqrt(tau_lin * sig * elem.area_m2 / (2.0 * np.pi))
 
     def _incidence_angle(self, elem: Coupling, src) -> float:
         """Angle from the element normal of the ray arriving from ``src``."""

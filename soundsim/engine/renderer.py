@@ -31,6 +31,7 @@ def render(scene: Scene, sample_rate: int = 48_000,
         length = int(min(ir_length_cap_s, _needed_length_s(paths, tails)) * sample_rate)
     res = synthesize(paths, _merge_tails(tails), sample_rate, length=length,
                      band_centres=band_centres, seed=seed)
+    res = remove_subsonic(res, scene)
     res = apply_modal_lowband(res, scene)
     res.metrics.update(measure(res, scene))
     return res
@@ -154,6 +155,26 @@ def render_pair(scene: Scene, sample_rate: int = 48_000,
         irs.append(r.ir)
         first = first or r
     return irs, first
+
+
+def remove_subsonic(res: RenderResult, scene: Scene, f_lo: float = 15.0):
+    """Strip energy below audibility from the synthesised response.
+
+    A 1/3-octave band centred at 25 Hz cannot be represented honestly in a
+    response only a few cycles long: the burst's spectrum smears down to DC, and
+    that fake sub-10 Hz content is precisely what makes a small speaker's cone
+    pump and the output distort.  Nothing audible is touched -- 15 Hz is two
+    octaves below the lowest note most people can hear on speakers -- and the
+    metrics (T60, C50, band balance) are unchanged to within a few thousandths
+    of a dB.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    if res.sample_rate / 2.0 <= f_lo:
+        return res
+    sos = butter(2, f_lo / (res.sample_rate / 2.0), btype="high", output="sos")
+    res.ir = sosfiltfilt(sos, res.ir)
+    return res
 
 
 def apply_source_strength(paths: list[Path], tails: list[Tail], spl_at_1m_db: float):

@@ -13,7 +13,7 @@ from soundsim.engine import presets, renderer
 from soundsim.engine.bands import BAND_CENTRES, band_windows
 from soundsim.engine.convolver import PartitionedConvolver
 from soundsim.engine.paths import PathBuilder, build_paths
-from soundsim.engine.player import demo_material
+from soundsim.engine.player import Material, Player, demo_material
 from soundsim.engine.rir import Tail, synthesize
 from soundsim.engine.scene import Coupling, Room, Scene, Source
 
@@ -194,3 +194,133 @@ def test_render_pair_gives_two_decorrelated_channels():
     a, b = irs[0], irs[1]
     corr = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
     assert 0.2 < corr < 0.999            # related but not identical
+
+
+def test_mono_material_drives_a_stereo_output_without_breaking():
+    """A mono file used to raise inside the PortAudio callback, which left the
+    stream alive, holding the device and producing silence."""
+    from soundsim.engine.player import Player
+
+    p = Player(sample_rate=48_000, channels=2)
+    mono = Material("mono", np.sin(2 * np.pi * 300 * np.arange(9600) / 48_000)[:, None],
+                    48_000)
+    p.set_material(mono)
+    ir = np.zeros(400)
+    ir[0], ir[120] = 0.9, 0.4
+    p.set_impulse_responses([ir, ir])
+    p.playing = True
+    peak, blocks = 0.0, p.conv.latency_samples // 256 + 4
+    for _ in range(blocks):                          # the pipeline has latency
+        out = np.zeros((256, 2))
+        p._callback(out, 256, None, None)
+        assert np.allclose(out[:, 0], out[:, 1])      # mono -> both speakers
+        peak = max(peak, float(np.max(np.abs(out))))
+    assert p.error is None
+    assert peak > 0.0
+
+    assert Player._match_channels(np.ones((4, 6)), 2).shape == (4, 2)
+    assert Player._match_channels(np.ones((4, 1)), 3).shape == (4, 3)
+    assert Player._match_channels(np.ones((4, 2)), 2).shape == (4, 2)
+
+
+def test_a_faulty_callback_reports_and_hands_the_device_back():
+    from soundsim.engine.player import Player
+
+    class Dead:
+        latency_samples = 1024
+
+        def process(self, frames):
+            raise RuntimeError("simulated convolver fault")
+
+    p = Player(sample_rate=48_000, channels=2)
+    p.set_material(demo_material(0.5, 48_000))
+
+    class FakeStream:
+        active = True
+        closed = False
+
+        def stop(self):
+            self.active = False
+
+        def close(self):
+            self.closed = True
+
+    stream = FakeStream()
+    p._stream = stream
+    p.conv = Dead()
+    p.playing = True
+    p._callback(np.zeros((256, 2)), 256, None, None)
+    assert "simulated convolver fault" in (p.error or "")
+    assert p.playing is False
+    assert stream.closed is True                      # device is free again
+    assert p._stream is None
+
+
+def test_monitor_gain_never_leaves_the_output_clipping():
+    from soundsim.engine.player import Player
+
+    sc = presets.make("inside_car")
+    irs, res = renderer.render_pair(sc, 48_000)
+    p = Player(sample_rate=48_000, channels=2)
+    p.set_material(demo_material(2.0, 48_000))
+    p.set_impulse_responses(irs)
+    p.set_monitor_gain_for(res.metrics["total_spl_db"], target_spl_db=140.0)
+    p.playing = True
+    peak = 0.0
+    for _ in range(120):
+        out = np.zeros((512, 2))
+        p._callback(out, 512, None, None)
+        peak = max(peak, float(np.max(np.abs(out))))
+    assert peak < 1.0
+    assert p.limited_by == "output headroom"
+
+
+def test_player_consumes_material_at_exactly_real_time():
+    """Feeding the convolver more samples than the device asked for makes the
+    read head outrun the clock: everything plays ~2x fast, an octave sharp."""
+    fs, frames = 48_000, 960
+    p = Player(sample_rate=fs, channels=1)
+    p.set_material(Material("tone", np.zeros((fs * 10, 1)), fs))
+    ir = np.zeros(2000)
+    ir[0] = 1.0
+    p.set_impulse_responses([ir])
+    p.playing = True
+    buf = np.zeros((frames, 1))
+    for _ in range(250):                        # 250 * 960 = 5.000 s of device time
+        p._callback(buf, frames, None, None)
+    assert p.position_seconds == pytest.approx(5.0, abs=1.0 / fs)
+
+
+def test_pitch_survives_the_scene():
+    fs, frames = 48_000, 960
+    sc = presets.make("across_the_room")
+    res = renderer.render(sc, fs)
+    t = np.arange(fs * 4) / fs
+    p = Player(sample_rate=fs, channels=1)
+    p.set_material(Material("tone", np.sin(2 * np.pi * 200.0 * t)[:, None], fs))
+    p.set_impulse_responses([res.ir])
+    p.playing = True
+    out = []
+    for _ in range(150):
+        buf = np.zeros((frames, 1))
+        p._callback(buf, frames, None, None)
+        out.append(buf[:, 0])
+    y = np.concatenate(out)[3000:]              # skip the pipeline latency
+    f = np.fft.rfftfreq(len(y), 1.0 / fs)
+    assert f[int(np.argmax(np.abs(np.fft.rfft(y))))] == pytest.approx(200.0, abs=2.0)
+
+
+def test_convolver_queue_does_not_grow_while_streaming():
+    """A queue that grows every callback is both a memory leak and a buzz source:
+    the surplus gets chopped at the block period, which is a sub-bass tone."""
+    from soundsim.engine.convolver import CrossfadeConvolver
+
+    fs, frames = 48_000, 960
+    c = CrossfadeConvolver(channels=2, block=512)
+    rng = np.random.default_rng(4)
+    c.set_ir([rng.standard_normal(20_000) * 1e-3] * 2, 0.0, fs)
+    sizes = []
+    for _ in range(400):
+        c.process(rng.standard_normal((frames, 2)))
+        sizes.append(c._out_left.shape[0])       # queued surplus, must stay small
+    assert max(sizes) <= 4 * 512                # bounded, never cumulative

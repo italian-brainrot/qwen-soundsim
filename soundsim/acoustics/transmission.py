@@ -295,6 +295,31 @@ def aperture_transmission(freqs_hz, area_m2: float, temp_c: float = 20.0) -> np.
     return np.clip(4.0 * np.real(z) / np.abs(z + 1.0) ** 2, 0.0, 1.0)
 
 
+def radiation_efficiency(freqs_hz, area_m2: float, temp_c: float = 20.0) -> np.ndarray:
+    """Fraction of a baffled piston's vibration that actually leaves as sound.
+
+        sigma = 1 - J1(2ka) / (ka),      a = sqrt(S / pi)
+
+    This is the missing half of low-frequency transmission.  A plate model says
+    a window or a door isolates only a few dB below its double-leaf resonance --
+    true, and why neighbours are all thump -- but the infinite-baffle transmission
+    coefficient also assumes the partition can couple to the air.  Once the
+    wavelength is long compared with the element (ka < 1) it cannot: the radiation
+    resistance collapses as (ka)^2, so most of what gets through the panel stays
+    as near-field motion and never propagates.
+
+    Without it, an engine can put more energy at 30 Hz out of a 2 m^2 window than
+    a real facade ever does -- inaudible, all of it in the cone, all of it buzz.
+    """
+    f = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
+    a = math.sqrt(max(float(area_m2), 1e-6) / math.pi)
+    ka = 2.0 * np.pi * f * a / speed_of_sound(temp_c)
+    small = ka < 1e-3
+    sig = np.where(small, 0.5 * np.maximum(ka, 1e-9) ** 2,
+                   1.0 - j1(2.0 * np.maximum(ka, 1e-9)) / np.maximum(ka, 1e-9))
+    return np.clip(sig, 0.0, 1.2)
+
+
 def piston_directivity(freqs_hz, area_m2: float, angle_rad: float, temp_c: float = 20.0,
                        n_theta: int = 129) -> np.ndarray:
     """Energy-normalised directivity of a baffled piston, ``D(theta, f)``.

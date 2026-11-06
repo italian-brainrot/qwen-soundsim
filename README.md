@@ -69,6 +69,7 @@ belongs to the room you cannot see.
 | Rooms | Sabine + Fitzroy + atmospheric area `A_air = 0.9214·α·V`, Schroeder frequency | `test_sabine_matches_hand_computation`, `test_schroeder_frequency_small_room_high_large_room_low`, engine tests |
 | Early reflections | image sources with per-wall `√(1−α)` per hit, 1/r, air absorption | `test_first_order_distances_are_mirror_distances`, `test_ism_is_reciprocal`, `test_reflection_sequence_count_matches_textbook` |
 | Low-frequency regime | exact Rayleigh modal sum of the box (Krenk free-field subtraction), per-mode absorption ⇒ per-mode Q | `test_cube_axial_modes`, modal decay = Sabine (7.11 s vs 7.11 s), cabin axial modes at 39.0 / 78.0 / 95.3 / 117.0 Hz |
+| Low-frequency validity of the diffuse field | Weyl's mode count per 1/3-oct band, `4πVf²Δf/c³`, weights the reverberant build-up: below about one mode per band the room cannot store the diffuse amount | (checked via the sub-60 Hz share of every rendered response) |
 | Late field | diffuse energy balance `E/E_dir = 1 + 16πr²/A`, tail scaled to the remainder | `test_energy_balance_holds_for_an_enclosed_room`, `test_synth_tail_reproduces_its_own_decay_time`, `test_room_response_measured_t60_matches_sabine_in_the_diffuse_regime` |
 | Real-time core | uniform partitioned FFT convolution, exact | `test_partitioned_convolver_is_exact_for_any_block_size` (rel. err ~3e-16) |
 
@@ -84,6 +85,29 @@ Measured against analysis (this repo, not literature values copied in):
 * 300 m of cold, dry air removes far more at 8 kHz than at 250 Hz, and the
   humidity dependence flips sign between 2 kHz and 8 kHz — the behaviour the
   relaxation model predicts.
+
+## Level staging (why "quiet scene" never means "crank the gain")
+
+The response is absolutely calibrated, and the monitor path is deliberately
+separate from the physics:
+
+* **Full-scan peak prediction** — the whole material is convolved with the
+  response in 30 s chunks and the monitor gain is set so the true worst sample
+  fits with headroom.  Guessing from the first seconds clips later passages,
+  and a clipped bass render is heard as buzzing.
+* **Soft limiter** as a last resort: one-block attack, ~1 s release.  Hard
+  clipping of a bass-heavy render is the single worst-sounding failure mode an
+  auralizer has, so it is not used.
+* **Sub-15 Hz removal** on the synthesised response.  A 1/3-octave band at 25 Hz
+  cannot be represented in a response a few cycles long, and the smearing down to
+  DC is synthesis artefact, not room acoustics: it was 2-3 % of the energy, all
+  of it inaudible and all of it in the speaker cone.
+* **Monitor low-cut** (default off): for speakers that cannot reach the lowest
+  octave.  Off keeps the physics literal; the plots and dB figures never change.
+
+Measured linearity of the render path: a 1 kHz sine through the "party next door"
+response stays at 1 kHz — energy below 40 Hz is 67 dB down, block-rate artefacts
+63 dB down, harmonic distortion 123 dB down.
 
 ## Honest limitations
 
@@ -106,6 +130,13 @@ Measured against analysis (this repo, not literature values copied in):
 * **No head, no HRTF.**  Stereo is a spaced pair: correct inter-channel cues, but
   front/back and elevation cues are absent.  Mono downmix is honest "one
   microphone" output.
+* **Bass through glass is genuinely bad news.**  Below the double-leaf resonance
+  the two leaves move together and a window isolates only some dB, so a scene
+  like *party next door* really is dominated by 25-120 Hz at the listener: 30-40
+  dB more transmission there than at 2 kHz.  If that sounds like a buzzing rumble
+  on your speakers, it is the cone failing to make 40 Hz, not the model — use the
+  monitor low-cut or headphones, and the band-balance plot will show the tilt is
+  what the construction predicts.
 * **Cascaded-room levels carry real uncertainty** (a few dB).  The corridor /
   two-partition chain is built from the standard incoherent cascade of
   transmissions and reverberant energy balances, which is what building

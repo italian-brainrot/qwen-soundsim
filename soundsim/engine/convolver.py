@@ -106,6 +106,7 @@ class CrossfadeConvolver:
         self.block = block
         self.conv = [PartitionedConvolver(block) for _ in range(self.channels)]
         self.next_conv: list[PartitionedConvolver] | None = None
+        self.irs: list[np.ndarray] = []      # kept for level prediction
         self.fade_samples = 0
         self.fade_index = 0
         # The block machinery needs one block of latency; priming the output queue
@@ -124,6 +125,8 @@ class CrossfadeConvolver:
         new = [PartitionedConvolver(self.block) for _ in range(self.channels)]
         for i, c in enumerate(new):
             c.set_ir(irs[i % len(irs)])
+        self.irs = [np.asarray(irs[i % len(irs)], dtype=np.float64)
+                    for i in range(self.channels)]
         if self.fade_samples == 0:
             self.conv = new
             self.next_conv = None

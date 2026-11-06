@@ -143,6 +143,29 @@ def room_modes(dims, f_max: float = 250.0, temp_c: float = 20.0):
     return out
 
 
+def mode_count_weight(freqs_hz, volume_m3, temp_c: float = 20.0) -> np.ndarray:
+    """How much of the diffuse reverberant build-up a room can actually hold.
+
+    The diffuse field picture assumes the energy is spread over a dense forest of
+    resonances.  Weyl's count says the number of modes inside a 1/3-octave band
+    around ``f`` is ``4 pi V f^2 df / c^3``; when that drops below one, the room
+    has too few resonances to sustain a reverberant field at that frequency, and
+    a diffuse model driven by ``16 pi r^2 / A`` predicts a lot of energy that
+    physically cannot build up.
+
+    That is not an academic point: the absorption area also shrinks at low
+    frequency, so an uncorrected diffuse tail piles enormous sub-60 Hz energy
+    into the output -- inaudible on small speakers, and loud enough to make the
+    cone pump and the limiter buzz.  The weight is 1 when the band is modal-rich
+    and rolls off as ``f^2`` where it is not.
+    """
+    f = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
+    c = speed_of_sound(temp_c)
+    df = f * (2.0 ** (1 / 6) - 2.0 ** (-1 / 6))          # 1/3-octave bandwidth
+    n_modes = 4.0 * np.pi * max(float(volume_m3), 1e-9) * f**2 * df / c**3
+    return n_modes / (n_modes + 1.0)
+
+
 def modal_density(f_hz: float, volume_m3, t60: float) -> float:
     """Mean modal density (modes per Hz), the high-frequency asymptote.
 

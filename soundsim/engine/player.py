@@ -37,7 +37,53 @@ class Material:
         return len(self.samples) / self.sample_rate
 
 
-SUPPORTED = (".wav", ".flac", ".ogg", ".aiff", ".au", ".raw", ".w64", ".aif")
+def _libsndfile_formats() -> tuple[str, ...]:
+    """Extensions libsndfile itself can decode (mp3 included since 1.1)."""
+    try:
+        # the dict keys are the extensions libsndfile will actually open; the
+        # FormatInfo.name is the *container* it decodes into (mp3 arrives as
+        # "wav"), so the keys are what matters here
+        exts = {k.lower() for k in sf.available_formats()}
+    except Exception:                                     # pragma: no cover
+        exts = set()
+    keep = {"wav", "flac", "ogg", "aiff", "aif", "au", "raw", "w64", "mp3",
+            "wavpack", "caf"} & exts
+    return tuple("." + k for k in sorted(keep))
+
+
+SUPPORTED = _libsndfile_formats()
+NEED_FFMPEG = (".m4a", ".aac", ".mp4", ".opus", ".webm", ".wma")
+
+
+def pick_default_output() -> int | None:
+    """Prefer the session manager's sink over a bare ALSA HDMI port.
+
+    PortAudio sees every ALSA device, and on this kind of setup the ALSA
+    "default output" is an HDMI port that goes nowhere, while the audible sink
+    is the PulseAudio/PipeWire one.  Choosing it silently is the difference
+    between "nothing happens" and audio.
+    """
+    try:
+        infos = sd.query_devices()
+        default_out = sd.default.device[1]
+        if default_out is not None and default_out >= 0:
+            d = infos[default_out]
+            name = (d.get("name") or "").lower()
+            looks_muted = "hdmi" in name or "digital stereo" in name
+            if not looks_muted:
+                return int(default_out)
+        for ha in sd.query_hostapis():
+            if "pulse" in ha["name"].lower() or "pipewire" in ha["name"].lower():
+                dev = ha["default_output_device"]
+                if dev is not None and dev >= 0:
+                    return int(dev)
+        for i, d in enumerate(infos):
+            if d.get("max_output_channels", 0) > 0 and \
+                    "pulse" in sd.query_hostapis()[d["hostapi"]]["name"].lower():
+                return i
+    except Exception:                                     # pragma: no cover
+        pass
+    return None
 
 
 def load_file(path: str | Path, target_rate: int | None = None) -> Material:
@@ -129,6 +175,11 @@ class Player:
         self.gain_db = 0.0
         self.clip_flag = 0
         self.peak = 0.0
+        self.error: str | None = None         # last audio-callback problem
+        self.device_used: int | None = None
+        self.limited_by = "scene level"
+        self._lim = 1.0
+        self._lim_prev = 1.0
         self._stream: sd.OutputStream | None = None
         self._pending_ir: list[np.ndarray] | None = None
         self._pending_fade = 0.03
@@ -157,6 +208,12 @@ class Player:
         return self.index / self.sample_rate if self.material else 0.0
 
     @property
+    def output_latency_seconds(self) -> float:
+        """Fixed delay of the partitioned convolution pipeline (not a lag: it is
+        a constant offset, so nothing about the sound depends on it)."""
+        return self.conv.latency_samples / self.sample_rate
+
+    @property
     def duration_seconds(self) -> float:
         if self.material is None:
             return 0.0
@@ -165,7 +222,8 @@ class Player:
     # -- output level ---------------------------------------------------
     def set_monitor_gain_for(self, received_spl_db: float,
                              target_spl_db: float = 70.0,
-                             floor_db: float = -12.0, ceiling_db: float = 46.0):
+                             floor_db: float = -12.0, ceiling_db: float = 46.0,
+                             headroom: float = 0.85):
         """Set the playback gain from the scene's predicted received level.
 
         The simulation is absolutely calibrated (a unit-rms signal is 1 Pa at
@@ -177,9 +235,42 @@ class Player:
         part of the physics.
         """
         gain_db = float(np.clip(target_spl_db - received_spl_db, floor_db, ceiling_db))
+        # A live room (inside a car at 97 dB SPL) can still be far too hot for
+        # the output even after the cut, so predict the real peak by convolving
+        # the first seconds of the material and pull the gain down to fit.
+        self.limited_by = "scene level"
+        if self.material is not None and self.conv.irs:
+            probe = self._probe_peak(self.material, self.conv.irs[0])
+            predicted = probe * 10.0 ** (gain_db / 20.0)
+            if predicted > headroom:
+                gain_db -= 20.0 * math.log10(predicted / headroom)
+                self.limited_by = "output headroom"
         self.gain_db = gain_db
         self.gain = 10.0 ** (gain_db / 20.0)
         return gain_db
+
+    @staticmethod
+    def _probe_peak(material: "Material", ir: np.ndarray,
+                    seconds: float | None = None) -> float:
+        """Worst-case sample magnitude of material * ir.
+
+        Scans the whole material in chunks: a short probe misses a loud passage
+        further in, and then the gain that was set for it clips -- which on bass
+        content is heard as buzzing.
+        """
+        total = len(material.samples) if seconds is None else \
+            min(len(material.samples), int(seconds * material.sample_rate))
+        chunk = max(1, int(30.0 * material.sample_rate))
+        nfft = 1 << int(np.ceil(np.log2(chunk + len(ir))))
+        spec_ir = np.fft.rfft(ir, nfft)
+        peak = 0.0
+        for start in range(0, total, chunk):
+            x = material.samples[start:min(start + chunk, total), 0]
+            y = np.fft.irfft(np.fft.rfft(x, nfft) * spec_ir, nfft)
+            peak = max(peak, float(np.max(np.abs(y))) if len(y) else 0.0)
+            if peak <= 0.0:
+                continue
+        return peak
 
     # -- scene response -------------------------------------------------
     def set_impulse_responses(self, irs, crossfade_s: float = 0.03):
@@ -188,43 +279,74 @@ class Player:
 
     # -- transport ------------------------------------------------------
     def start(self):
-        """Open the output stream, falling back to the device's own rate.
+        """Open the output stream, trying the plausible devices and rates.
 
-        Some hosts (and some HDMI sinks) will not accept 48 kHz; rather than
-        staying silent, the player re-renders nothing but resamples the material
-        and uses whatever rate the device actually wants.
+        Two things go wrong on real desktops and both look like "nothing
+        happens": the system default is an HDMI port that refuses the rate, or a
+        stream that died inside the callback is still holding the device.  So any
+        existing stream is released first, then each candidate device is opened
+        at the target rate and at 44.1 kHz.
         """
-        if self._stream is not None:
+        if self._stream is not None and getattr(self._stream, "active", False):
             return
-        for rate in (self.sample_rate, 44_100):
-            try:
-                self._stream = sd.OutputStream(
-                    samplerate=rate, channels=self.channels, device=self.device,
-                    blocksize=int(self.latency_s * rate), dtype="float32",
-                    callback=self._callback, finished_callback=self._stream_finished)
-                self._stream.start()
-                if rate != self.sample_rate and self.material is not None:
-                    self.sample_rate = rate
-                    if self.material.sample_rate != rate:
-                        self.material = load_file(self.material.path, rate) \
-                            if self.material.path else Material(
-                                self.material.name,
-                                resample_poly(self.material.samples, rate,
-                                              self.material.sample_rate, axis=0),
-                                rate, self.material.path)
+        self.stop_stream()                    # release a half-dead stream first
+        devices = list(dict.fromkeys([self.device, pick_default_output(), None]))
+        tried = []
+        for dev in devices:
+            for rate in (self.sample_rate, 44_100):
+                try:
+                    stream = sd.OutputStream(
+                        samplerate=rate, channels=self.channels, device=dev,
+                        blocksize=int(self.latency_s * rate), dtype="float32",
+                        callback=self._callback,
+                        finished_callback=self._stream_finished)
+                    stream.start()
+                except Exception as exc:
+                    tried.append(f"dev={dev} {rate} Hz ({type(exc).__name__})")
+                    continue
+                self._stream = stream
+                self.device_used = dev
+                self.error = None
+                if rate != self.sample_rate:
+                    self._adopt_rate(rate)
                 return
-            except Exception:
-                self._stream = None
-        raise RuntimeError("no output device accepted this stream")
+        raise RuntimeError("no output device accepted this stream -- tried: "
+                           + "; ".join(tried))
+
+    def _adopt_rate(self, rate: int):
+        """The device wanted a different rate: re-decode the material to match."""
+        self.sample_rate = int(rate)
+        if self.material is None:
+            return
+        m = self.material
+        if m.sample_rate == rate:
+            return
+        pos = self.position_seconds
+        if m.path:
+            self.material = load_file(m.path, rate)
+        else:
+            g = math.gcd(int(m.sample_rate), int(rate))
+            self.material = Material(
+                m.name, resample_poly(m.samples, rate // g,
+                                      m.sample_rate // g, axis=0), int(rate), m.path)
+        self.set_position_seconds(pos)
 
     def _stream_finished(self, *a):
         self._stream = None
 
     def stop_stream(self):
-        if self._stream is not None:
-            s, self._stream = self._stream, None
-            s.stop()
-            s.close()
+        """Close the stream and, crucially, hand the device back."""
+        st, self._stream = self._stream, None
+        if st is None:
+            return
+        try:
+            st.stop()
+        except Exception:
+            pass
+        try:
+            st.close()
+        except Exception:
+            pass
 
     def play(self):
         self.playing = True
@@ -239,25 +361,77 @@ class Player:
         else:
             self.play()
 
-    # -- callback -------------------------------------------------------
-    def _callback(self, outdata, frames, time_info, status):
-        if self.material is None:
-            outdata[:] = 0.0
-            return
-        need = frames + self.conv.latency_samples
-        end = min(self.index + need, len(self.material.samples))
-        chunk = self.material.samples[self.index:end]
-        self.index = end
-        if len(chunk) < need:                       # ran out: pad and stop
-            chunk = np.pad(chunk, ((0, need - len(chunk)), (0, 0)))
-            if end >= len(self.material.samples):
-                self.playing = False
-        if not self.playing:
-            chunk = np.zeros((need, self.channels))
-        out = self.conv.process(chunk[:, :self.channels]) * self.gain
+    # -- limiter --------------------------------------------------------
+    def limit(self, out: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
+        """Safety limiter: fast attack, slow release, no square-wave buzz.
+
+        Hard clipping a bass-heavy render is exactly the "buzzing" sound people
+        blame on the simulation.  The gain is normally set from a full scan of the
+        material so this rarely engages; when it does it rides the level down over
+        a couple of blocks instead of chopping waveform tops off.
+        """
         peak = float(np.max(np.abs(out))) if len(out) else 0.0
-        if peak > 1.0:
+        if peak > ceiling:
+            want = ceiling / peak
+            self._lim = max(want, min(self._lim, 1.0) * 0.6)   # ~1 block attack
             self.clip_flag += 1
-            out = np.clip(out, -1.0, 1.0)
-        self.peak = max(0.9 * self.peak, peak)
-        outdata[:] = out[:frames]
+        else:
+            self._lim = min(1.0, self._lim * 1.02)             # ~1 s release
+        if self._lim < 1.0:
+            ramp = np.linspace(self._lim_prev, self._lim, out.shape[0])[:, None]
+            out = out * ramp
+        self._lim_prev = self._lim
+        return out
+
+    # -- callback -------------------------------------------------------
+    @staticmethod
+    def _match_channels(chunk: np.ndarray, want: int) -> np.ndarray:
+        """Mono stays mono on both speakers, 5.1 keeps its front pair, etc."""
+        have = chunk.shape[1]
+        if have == want:
+            return chunk
+        if have == 1:
+            return np.repeat(chunk, want, axis=1)
+        if have < want:
+            out = np.zeros((chunk.shape[0], want))
+            out[:, :have] = chunk
+            return out
+        return chunk[:, :want]
+
+    def _callback(self, outdata, frames, time_info, status):
+        """Never let a glitch propagate.
+
+        A PortAudio callback that raises either kills the stream or leaves it
+        alive, holding the device and producing silence -- which from outside is
+        indistinguishable from "the app does nothing".  So the callback is
+        wrapped, the failure is recorded for the UI, and the device is released.
+        """
+        outdata[:] = 0.0
+        if self.material is None:
+            return
+        try:
+            # Feed *exactly* what the device asked for.  Over-feeding to "cover"
+            # the convolver's latency looks harmless but consumes the material
+            # faster than real time (2x speed, an octave of pitch shift, and a
+            # queue that grows without bound); the latency is simply a fixed
+            # delay, which is what output_latency_seconds reports.
+            end = min(self.index + frames, len(self.material.samples))
+            chunk = self.material.samples[self.index:end]
+            self.index = end
+            if len(chunk) < frames:                 # material ran out
+                chunk = np.pad(chunk, ((0, frames - len(chunk)), (0, 0)))
+                if end >= len(self.material.samples):
+                    self.playing = False
+            if not self.playing:
+                # the material is silent but the room is not: keep feeding zeros
+                # so the tail rings out instead of being cut off
+                chunk = np.zeros((frames, self.channels))
+            chunk = self._match_channels(chunk, self.channels)
+            out = self.limit(self.conv.process(chunk) * self.gain)
+            peak = float(np.max(np.abs(out))) if len(out) else 0.0
+            self.peak = max(0.9 * self.peak, peak)
+            outdata[:] = out[:frames]
+        except Exception as exc:                    # pragma: no cover
+            self.error = f"audio callback: {type(exc).__name__}: {exc}"
+            self.playing = False
+            self.stop_stream()

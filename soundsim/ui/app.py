@@ -17,6 +17,8 @@ import time
 import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
+from scipy.signal import butter, sosfiltfilt
+
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QMainWindow,
@@ -25,7 +27,9 @@ from PySide6.QtWidgets import (
 
 from ..acoustics.materials import GROUNDS
 from ..engine import presets, renderer
-from ..engine.player import Player, demo_material, load_file
+from ..engine.player import SUPPORTED
+from ..engine.player import (NEED_FFMPEG, Player, demo_material,
+                              load_file, pick_default_output)
 from ..engine.scene import Scene
 from .plots import Plot
 
@@ -76,7 +80,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SoundSim — acoustic environment simulator")
         self.resize(1360, 860)
         self.sample_rate = 48_000
-        self.player = Player(sample_rate=self.sample_rate, channels=2)
+        self.player = Player(sample_rate=self.sample_rate, channels=2,
+                             device=pick_default_output())
         self.scene: Scene = presets.make("party_next_door")
         self.base_distance = self._listener_distance()
         self.last_result = None
@@ -153,8 +158,7 @@ class MainWindow(QMainWindow):
 
         self.playlist_view = QListWidget()
         self.playlist_view.setMaximumHeight(88)
-        self.playlist_view.itemDoubleClicked.connect(
-            lambda it: self._load_material(load_file(it.text(), self.sample_rate)))
+        self.playlist_view.itemDoubleClicked.connect(self._open_playlist_item)
 
         middle = QVBoxLayout()
         middle.addWidget(grid, 3)
@@ -176,6 +180,15 @@ class MainWindow(QMainWindow):
         self.in_ground = QComboBox(); self.in_ground.addItems(sorted(GROUNDS)); self.in_ground.setCurrentText(self.scene.outdoors.ground)
         self.in_cap = QDoubleSpinBox(); self.in_cap.setRange(0.5, 20); self.in_cap.setDecimals(1); self.in_cap.setValue(6.0); self.in_cap.setSuffix(" s")
         self.in_delay = QCheckBox(); self.in_delay.setChecked(False)
+        self.in_lowcut = QComboBox()
+        for hz, lab in ((0, "off (full physics)"), (30, "30 Hz"), (50, "50 Hz"),
+                        (80, "80 Hz")):
+            self.in_lowcut.addItem(lab, hz)
+        self.in_lowcut.setCurrentIndex(1)      # 30 Hz: below what speakers make
+        self.in_lowcut.setToolTip(
+            "Playback-only bass trim for speakers that cannot reach the "
+            "lowest octave. The simulation keeps everything; the response "
+            "and the dB figures are unaffected.")
         self.in_auto_gain = QCheckBox(); self.in_auto_gain.setChecked(True)
         self.in_auto_gain.setToolTip("Map the predicted received level onto a "
                                      "comfortable playback level. Pure monitoring "
@@ -187,8 +200,11 @@ class MainWindow(QMainWindow):
                 w.currentTextChanged.connect(self.request_render)
             else:
                 w.valueChanged.connect(self.request_render)
-        for w in (self.in_tail, self.in_modal, self.in_delay, self.in_auto_gain):
+        self.in_lowcut.currentIndexChanged.connect(lambda *_: self._apply_monitoring())
+        for w in (self.in_tail, self.in_modal):          # physics: re-render
             w.toggled.connect(self.request_render)
+        for w in (self.in_delay, self.in_auto_gain):     # monitoring only
+            w.toggled.connect(lambda *_: self._apply_monitoring())
         form.addRow(PARAM_LABELS["spl"], self.in_spl)
         form.addRow(PARAM_LABELS["f3"], self.in_f3)
         form.addRow(PARAM_LABELS["distance"], self.in_distance)
@@ -202,25 +218,34 @@ class MainWindow(QMainWindow):
         form.addRow(PARAM_LABELS["ir_cap"], self.in_cap)
         form.addRow(PARAM_LABELS["delay_comp"], self.in_delay)
         form.addRow("Auto monitor gain (playback only)", self.in_auto_gain)
+        form.addRow("Monitor low-cut (playback only)", self.in_lowcut)
 
         self.device_box = QComboBox()
         try:
             import sounddevice as sd
             infos = sd.query_devices()
-            self.device_box.addItem("(system default)", None)
+            self.device_box.addItem("(auto: session sink)", None)
             for i, d in enumerate(infos):
                 if d.get("max_output_channels", 0) > 0:
-                    self.device_box.addItem(f"{i}: {d['name'][:44]}", i)
+                    host = sd.query_hostapis()[d["hostapi"]]["name"]
+                    self.device_box.addItem(f"[{host}] {d['name'][:40]}", i)
+            want = self.player.device
+            row = self.device_box.findData(want)
+            if row >= 0:
+                self.device_box.blockSignals(True)
+                self.device_box.setCurrentIndex(row)
+                self.device_box.blockSignals(False)
         except Exception:
             pass
         self.device_box.currentIndexChanged.connect(self._pick_device)
+        self._good_device = self.device_box.currentIndex()
 
         metrics = QGroupBox("Measured on the synthesised response")
         mform = QFormLayout(metrics)
         self.metric_labels: dict[str, QLabel] = {}
         for key in ("t60", "t60_mid", "c50", "c80", "d50", "ts", "itdg",
                     "schroeder", "modal", "paths", "irlen", "spl", "loss",
-                    "arrival", "render_time"):
+                    "arrival", "render_time", "latency", "bass"):
             lab = QLabel("—")
             self.metric_labels[key] = lab
             mform.addRow(_metric_name(key), lab)
@@ -319,13 +344,9 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _got_ir(self, irs, res, dt):
-        irs = list(irs)
-        if self.in_delay.isChecked():
-            irs = [_trim_delay(ir, self.sample_rate) for ir in irs]
-        self.player.set_impulse_responses(irs, crossfade_s=0.04)
-        if self.in_auto_gain.isChecked():
-            self.player.set_monitor_gain_for(res.metrics["total_spl_db"])
+        self._raw_irs = [np.asarray(ir, float) for ir in irs]
         self.last_result = res
+        self._apply_monitoring()
         self._refresh_plots(res)
         self._refresh_metrics(res, dt)
         self.status.setText(f"scene rendered in {dt:.2f} s")
@@ -333,6 +354,25 @@ class MainWindow(QMainWindow):
         if self.pending:
             self.pending.clear()
             self.request_render()
+
+    def _apply_monitoring(self):
+        """Playback stage only: bass trim, delay trim, level.  The response the
+        plots and metrics describe is the unmonitored physical one."""
+        if not getattr(self, "_raw_irs", None):
+            return
+        irs = list(self._raw_irs)
+        cut = self.in_lowcut.currentData()
+        if cut:
+            sos = butter(2, cut / (self.sample_rate / 2.0), btype="high",
+                         output="sos")
+            irs = [sosfiltfilt(sos, ir) for ir in irs]
+        if self.in_delay.isChecked():
+            irs = [_trim_delay(ir, self.sample_rate) for ir in irs]
+        self.player.set_impulse_responses(irs, crossfade_s=0.04)
+        if self.in_auto_gain.isChecked():
+            self.player.set_monitor_gain_for(self.last_result.metrics["total_spl_db"])
+        else:
+            self.player.gain, self.player.gain_db = 1.0, 0.0
 
     # ------------------------------------------------------------------
     # plots / metrics
@@ -400,18 +440,44 @@ class MainWindow(QMainWindow):
         first = min([p.delay_s for p in res.paths], default=0.0)
         setm["arrival"].setText(f"{first * 1000:.1f} ms first arrival")
         setm["render_time"].setText(f"{dt:.2f} s")
-        self.level.setToolTip(f"monitor gain {self.player.gain_db:+.1f} dB "
-                              "(playback calibration)")
+        setm["latency"].setText(f"{self.player.output_latency_seconds * 1000:.0f} ms "
+                                f"(fixed pipeline delay)")
+        # how much of the played-out energy is sub-bass: the number to look at
+        # when a speaker buzzes
+        if getattr(self.player, "conv", None) and self.player.conv.irs:
+            ir = self.player.conv.irs[0]
+            fr = np.fft.rfftfreq(len(ir), 1.0 / self.sample_rate)
+            S = np.abs(np.fft.rfft(ir)) ** 2
+            tot = S[fr > 15].sum()
+            if tot > 0:
+                sub = 10.0 * np.log10(max(S[fr < 60].sum(), 1e-30) / tot)
+                setm["bass"].setText(f"{sub:+.1f} dB of output energy below 60 Hz")
+            else:
+                setm["bass"].setText("--")
+        self.level.setToolTip(
+            f"monitor gain {self.player.gain_db:+.1f} dB "
+            f"(playback calibration, limited by {self.player.limited_by})")
 
     # ------------------------------------------------------------------
     # transport
     def _load_material(self, mat):
-        self.player.set_material(mat)
+        """Never let a bad decode leave the transport pointing at nothing."""
+        try:
+            self.player.set_material(mat)
+        except Exception as exc:
+            self.status.setText(f"could not play {getattr(mat, 'name', '?')}: {exc}")
+            self.status.setStyleSheet("color:#e07a7a;")
+            return
         self.seek.setValue(0)
         self._poll_player()
 
     def _toggle_play(self):
-        self.player.toggle()
+        try:
+            self.player.toggle()
+        except Exception as exc:
+            self.status.setText(f"cannot start audio: {exc}")
+            self.status.setStyleSheet("color:#e07a7a;")
+            return
         self.btn_play.setText("Pause" if self.player.playing else "Play")
 
     def _stop(self):
@@ -432,19 +498,29 @@ class MainWindow(QMainWindow):
         db = 20 * np.log10(max(pk, 1e-6))
         bars = int(np.clip((db + 60) / 60 * 20, 0, 20))
         self.level.setText("▮" * bars + f" {db:.0f} dB" +
-                           ("  CLIP" if self.player.clip_flag else ""))
+                           ("  LIMIT" if self.player.clip_flag else ""))
+        if self.player.error:
+            self.status.setText(self.player.error)
+            self.status.setStyleSheet("color:#e07a7a;")
+
+    def _open_playlist_item(self, item):
+        try:
+            self._load_material(load_file(item.text(), self.sample_rate))
+        except Exception as exc:
+            self.status.setText(f"cannot decode {os.path.basename(item.text())}: {exc}")
+            self.status.setStyleSheet("color:#e07a7a;")
 
     def _add_files(self):
+        pats = " ".join("*" + e for e in SUPPORTED) + " " + " ".join("*" + e for e in NEED_FFMPEG)
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Add audio", os.path.expanduser("~"),
-            "Audio (*.wav *.flac *.ogg *.aiff *.au *.mp3 *.m4a *.opus)")
+            self, "Add audio", os.path.expanduser("~"), f"Audio ({pats})")
         self._extend_playlist(files)
 
     def _add_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Add folder", os.path.expanduser("~"))
         if not d:
             return
-        exts = (".wav", ".flac", ".ogg", ".aiff", ".au", ".mp3", ".m4a")
+        exts = tuple(SUPPORTED) + tuple(NEED_FFMPEG)
         files = sorted(f for f in glob.glob(os.path.join(d, "**", "*"), recursive=True)
                        if f.lower().endswith(exts))
         self._extend_playlist(files)
@@ -457,11 +533,30 @@ class MainWindow(QMainWindow):
         self.playlist.extend(files)
 
     def _pick_device(self):
+        """Switch the output device, and say so if the box refuses it."""
         dev = self.device_box.currentData()
+        was_playing = self.player.playing
         self.player.stop_stream()
         self.player.device = dev
-        if self.player.playing:
-            self.player.start()
+        try:
+            if was_playing:
+                self.player.start()
+            self._good_device = self.device_box.currentIndex()
+            self.status.setText("output: " + str(self.device_box.currentText()))
+            self.status.setStyleSheet("color:#7fd18a;")
+        except Exception as exc:
+            self.status.setText(f"device refused ({type(exc).__name__}); "
+                                f"staying on {self.device_box.itemText(self._good_device)}")
+            self.status.setStyleSheet("color:#e07a7a;")
+            self.player.device = self.device_box.itemData(self._good_device)
+            self.device_box.blockSignals(True)
+            self.device_box.setCurrentIndex(self._good_device)
+            self.device_box.blockSignals(False)
+            if was_playing:
+                try:
+                    self.player.start()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):
@@ -490,6 +585,8 @@ def _metric_name(key: str) -> str:
         "loss": "Environment loss",
         "arrival": "First arrival",
         "render_time": "Render time",
+        "latency": "Output latency",
+        "bass": "Bass in output",
     }[key]
 
 
