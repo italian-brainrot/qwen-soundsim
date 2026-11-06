@@ -270,11 +270,20 @@ def measure(res: RenderResult, scene: Scene) -> dict:
     out["environment_loss_db"] = out["free_field_spl_db"] - out["total_spl_db"]
 
     # --- band-by-band level relative to free field ------------------------
-    e_paths = np.zeros(len(res.band_centres))
+    # Paths are summed as pressures with their delays, then the diffuse tails are
+    # added as energies -- exactly what the synthesised response does.  An
+    # incoherent path sum erases the two-ray interference, which over 300 m at a
+    # couple of degrees of grazing is worth more than 10 dB and is most of what
+    # "that sounds far away" actually consists of.
+    band = np.asarray(res.band_centres, dtype=np.float64)
+    acc = np.zeros(len(band), dtype=np.complex128)
+    t0 = min((p.delay_s for p in res.paths), default=0.0)
     for p in res.paths:
-        e_paths += np.abs(p.gains) ** 2
+        extra = np.zeros(len(band)) if p.delay_bands is None else p.delay_bands
+        acc = acc + p.gains * np.exp(-2.0j * np.pi * band * ((p.delay_s + extra) - t0))
+    e_paths = np.abs(acc) ** 2
     for t in (res.tail and [res.tail] or []):
-        e_paths += t.energy
+        e_paths = e_paths + t.energy
     # the paths already carry the source's calibration (spl_at_1m_db), so the
     # reference must carry it too or the band balance would show the source
     # level rather than what the environment does to it

@@ -177,6 +177,26 @@ class MainWindow(QMainWindow):
         self.in_temp = QDoubleSpinBox(); self.in_temp.setRange(-30, 50); self.in_temp.setValue(self.scene.weather.temp_c); self.in_temp.setSuffix(" °C")
         self.in_rh = QDoubleSpinBox(); self.in_rh.setRange(1, 100); self.in_rh.setValue(self.scene.weather.rh_pct); self.in_rh.setSuffix(" %")
         self.in_wind = QDoubleSpinBox(); self.in_wind.setRange(-10, 20); self.in_wind.setValue(self.scene.weather.wind_speed_ms); self.in_wind.setSuffix(" m/s")
+        self.in_turb = QComboBox()
+        for lab, val in (("still air", 0.0), ("slight", 0.15), ("moderate", 0.35),
+                         ("unsettled", 0.8)):
+            self.in_turb.addItem(lab, val)
+        self.in_turb.setCurrentIndex(2)
+        self.in_turb.setToolTip(
+            "Eddies make the ray path length wander by centimetres. A "
+            "centimetre is nothing at 100 Hz and a third of a wavelength at "
+            "10 kHz, so the direct/ground interference survives in the bass and "
+            "averages away in the treble. This is a static effect on the "
+            "response; it does not modulate the audio.")
+        self.in_waver = QComboBox()
+        for lab, val in (("off", 0.0), ("slight", 0.12), ("moderate", 0.25)):
+            self.in_waver.addItem(lab, val)
+        self.in_waver.setCurrentIndex(0)
+        self.in_waver.setToolTip(
+            "Optional: the same wander, seen as it happens -- the treble of "
+            "very distant sound breathes over a second or two while the bass "
+            "holds. Off by default: it is real, but it is also the least "
+            "certain number in the model.")
         self.in_ground = QComboBox(); self.in_ground.addItems(sorted(GROUNDS)); self.in_ground.setCurrentText(self.scene.outdoors.ground)
         self.in_cap = QDoubleSpinBox(); self.in_cap.setRange(0.5, 20); self.in_cap.setDecimals(1); self.in_cap.setValue(6.0); self.in_cap.setSuffix(" s")
         self.in_delay = QCheckBox(); self.in_delay.setChecked(False)
@@ -195,7 +215,8 @@ class MainWindow(QMainWindow):
                                      "calibration -- the response and the dB "
                                      "figures are untouched.")
         for w in (self.in_spl, self.in_f3, self.in_distance, self.in_order, self.in_temp,
-                  self.in_rh, self.in_wind, self.in_ground, self.in_cap):
+                  self.in_rh, self.in_wind, self.in_ground, self.in_turb,
+                  self.in_waver, self.in_cap):
             if isinstance(w, QComboBox):
                 w.currentTextChanged.connect(self.request_render)
             else:
@@ -215,6 +236,8 @@ class MainWindow(QMainWindow):
         form.addRow(PARAM_LABELS["rh"], self.in_rh)
         form.addRow(PARAM_LABELS["wind"], self.in_wind)
         form.addRow(PARAM_LABELS["ground"], self.in_ground)
+        form.addRow("Air turbulence (path wander)", self.in_turb)
+        form.addRow("Treble wavering over time", self.in_waver)
         form.addRow(PARAM_LABELS["ir_cap"], self.in_cap)
         form.addRow(PARAM_LABELS["delay_comp"], self.in_delay)
         form.addRow("Auto monitor gain (playback only)", self.in_auto_gain)
@@ -312,6 +335,14 @@ class MainWindow(QMainWindow):
         self.in_wind.blockSignals(True)
         self.in_wind.setValue(self.scene.weather.wind_speed_ms)
         self.in_wind.blockSignals(False)
+        self.in_waver.blockSignals(True)
+        self.in_waver.setCurrentIndex(0)
+        self.in_waver.blockSignals(False)
+        self.in_turb.blockSignals(True)
+        row = self.in_turb.findData(self.scene.weather.turbulence)
+        if row >= 0:
+            self.in_turb.setCurrentIndex(row)
+        self.in_turb.blockSignals(False)
         self.scene_desc.setText(self.scene.description)
         self.request_render()
 
@@ -325,6 +356,8 @@ class MainWindow(QMainWindow):
         sc.weather.rh_pct = self.in_rh.value()
         sc.weather.wind_speed_ms = self.in_wind.value()
         sc.outdoors.ground = self.in_ground.currentText()
+        sc.weather.turbulence = self.in_turb.currentData()
+        self.player.set_turbulence(self.in_waver.currentData())
         self._set_listener_distance(self.in_distance.value())
         return sc
 

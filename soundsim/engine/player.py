@@ -180,6 +180,12 @@ class Player:
         self.limited_by = "scene level"
         self._lim = 1.0
         self._lim_prev = 1.0
+        # amplitude wavering of a long path (see set_turbulence)
+        self.turbulence_depth = 0.0
+        self._turb_n = 0.0
+        self._turb_rng = np.random.default_rng()
+        self._turb_zi = None
+        self._turb_fc = 1200.0
         self._stream: sd.OutputStream | None = None
         self._pending_ir: list[np.ndarray] | None = None
         self._pending_fade = 0.03
@@ -361,6 +367,52 @@ class Player:
         else:
             self.play()
 
+    # -- turbulence -----------------------------------------------------
+    def set_turbulence(self, depth: float, seed: int | None = None):
+        """0..1 depth of the slow HF wavering a long outdoor path produces.
+
+        Eddies refract the wave front around, so the received field is not a
+        fixed filter: the high bands come and go over fractions of a second
+        while the bass is essentially unaffected.  Over hundreds of metres this
+        is one of the loudest cues that a sound is *far away* -- a static
+        low-pass curve, however accurate, sounds like an EQ instead.
+
+        The mechanism is physical; the depth is a knob, because it depends on
+        wind, temperature gradient and site, which the scene does not know.
+        """
+        self.turbulence_depth = float(np.clip(depth, 0.0, 1.0))
+        self._turb_zi = None
+        self._turb_n = 0.0
+        self._turb_rng = np.random.default_rng(seed)
+
+    def _turbulence(self, out: np.ndarray) -> np.ndarray:
+        depth = self.turbulence_depth
+        if depth <= 0.0 or out.size == 0:
+            return out
+        from scipy.signal import butter, sosfilt
+
+        if self._turb_zi is None:
+            # 4th order so the modulated upper band barely bleeds into the
+            # unmodulated lower one (with gain 1 the split is exact: low + high
+            # reconstructs the input, filter phase and all)
+            sos = butter(4, self._turb_fc / (self.sample_rate / 2.0), btype="low",
+                         output="sos")
+            self._turb_sos = sos
+            self._turb_zi = np.zeros((sos.shape[0], 2, out.shape[1]))
+        low = sosfilt(self._turb_sos, out, axis=0, zi=self._turb_zi)
+        out_low, self._turb_zi = low[0], low[1]
+        high = out - out_low
+
+        # Ornstein-Uhlenbeck: a mean-reverting random walk, the standard model
+        # for scintillation, with ~0.5 s correlation time
+        tau = 0.5
+        a = math.exp(-out.shape[0] / (tau * self.sample_rate))
+        b = math.sqrt(max(1.0 - a * a, 1e-9))
+        self._turb_n = a * self._turb_n + b * float(self._turb_rng.standard_normal())
+        # up to +-9 dB of HF swing at full depth, coherent between the channels
+        swing = 10.0 ** (depth * 9.0 * self._turb_n / 20.0)
+        return out_low + high * swing
+
     # -- limiter --------------------------------------------------------
     def limit(self, out: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
         """Safety limiter: fast attack, slow release, no square-wave buzz.
@@ -427,7 +479,7 @@ class Player:
                 # so the tail rings out instead of being cut off
                 chunk = np.zeros((frames, self.channels))
             chunk = self._match_channels(chunk, self.channels)
-            out = self.limit(self.conv.process(chunk) * self.gain)
+            out = self.limit(self._turbulence(self.conv.process(chunk) * self.gain))
             peak = float(np.max(np.abs(out))) if len(out) else 0.0
             self.peak = max(0.9 * self.peak, peak)
             outdata[:] = out[:frames]

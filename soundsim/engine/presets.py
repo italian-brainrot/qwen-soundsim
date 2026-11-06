@@ -256,7 +256,7 @@ def far_field_park(distance_m: float = 300.0, ground: str = "grass_short",
         outdoors=Outdoors(ground=ground),
         barriers=barriers,
         weather=Weather(temp_c=8.0, rh_pct=80.0, wind_speed_ms=3.0,
-                        wind_towards_receiver=1.0),
+                        wind_towards_receiver=1.0, turbulence=0.5),
         ism_order=0, diffuse_tail=False)
 
 

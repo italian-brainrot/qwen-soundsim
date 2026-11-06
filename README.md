@@ -65,6 +65,7 @@ belongs to the room you cannot see.
 | Wall / window | damped plate: mass law + coincidence + damping, diffuse field integral (Beranek); exact Rayleigh piston radiation | `test_normal_incidence_mass_law_is_exact`, `test_grazing_incidence_transmits_completely`, `test_coincidence_dip_exists_and_deepens_with_low_damping` |
 | Double leaf | air-spring resonance `f0 = 60√((m1+m2)/(m1m2d))`, below it the mass law of the sum, above it leaf-by-leaf + cavity bonus | `test_double_leaf_mass_air_mass_resonance` |
 | Openings | air-plug radiation impedance, `τ = 4Re z/|z+1|²`, Rayleigh limit `τ ≈ 2(ka)²` | `test_aperture_is_high_pass_relative_to_size` |
+| Ground reflection | JCA plane-wave coefficient **with phase**, carried into the synthesis as a per-band delay, so direct and reflected rays interfere | `test_a_park_swallows_the_mids_that_still_water_carries`, `test_hard_ground_is_louder_than_no_ground_at_all` |
 | Screens | Maekawa / ISO 9613-2, `10log10(3+20N)` with a numerically found edge point | `test_maekawa_zero_path_excess_is_4p8_db`, `test_barrier_geometry_detects_shadow` |
 | Rooms | Sabine + Fitzroy + atmospheric area `A_air = 0.9214·α·V`, Schroeder frequency | `test_sabine_matches_hand_computation`, `test_schroeder_frequency_small_room_high_large_room_low`, engine tests |
 | Early reflections | image sources with per-wall `√(1−α)` per hit, 1/r, air absorption | `test_first_order_distances_are_mirror_distances`, `test_ism_is_reciprocal`, `test_reflection_sequence_count_matches_textbook` |
@@ -85,6 +86,27 @@ Measured against analysis (this repo, not literature values copied in):
 * 300 m of cold, dry air removes far more at 8 kHz than at 250 Hz, and the
   humidity dependence flips sign between 2 kHz and 8 kHz — the behaviour the
   relaxation model predicts.
+
+## What distance actually sounds like
+
+At 300 m with the source 4 m up and the listener 1.5 m up, the two rays meet at
+about a degree of grazing. Over still water or asphalt `R = +1` and they add:
++5.9 dB relative to free field at 125 Hz. Over forest floor or dry sand the
+coefficient rotates by more than 150 degrees and the ground *subtracts*: −21.5 dB
+at the same frequency. That is a 27 dB difference in the low mids between two
+scenes that are otherwise identical, and it is interference, not absorption --
+which is why the band balance is computed as a coherent pressure sum, the same
+way the response is synthesised.
+
+Measured band balance for *distant stage in the park* (dB relative to free field
+at the same distance, 8 °C, 80 % RH):
+
+| ground | 125 Hz | 500 Hz | 1 kHz | 2 kHz | 4 kHz |
+|---|---|---|---|---|---|
+| still water / asphalt | +5.9 | +5.4 | +4.8 | +2.5 | −6.6 |
+| short grass | −1.1 | −7.0 | −11.4 | −8.6 | −8.1 |
+| long grass | −12.6 | −17.8 | −10.9 | −5.8 | −6.8 |
+| forest floor | −21.5 | −16.1 | −9.7 | −5.3 | −6.7 |
 
 ## Level staging (why "quiet scene" never means "crank the gain")
 
@@ -111,10 +133,21 @@ response stays at 1 kHz — energy below 40 Hz is 67 dB down, block-rate artefac
 
 ## Honest limitations
 
-* **Magnitude-only transmission and ground phase.**  Panel and ground transfer
+* **Ground interference is resolved only to a third of an octave.**  The
+  reflection coefficient's phase is carried as a per-band delay, which is exact
+  at a band centre and approximate across the band -- fine for the broad soft-
+  ground hollow, not for razor-thin combs.  Panel transmission is still applied
+  as a magnitude: around a coincidence dip the fine comb structure is
+  approximate.
+* **Atmospheric turbulence is a knob, not a prediction.**  Eddies make distant
+  treble waver over fractions of a second (the stage in the player: an
+  Ornstein-Uhlenbeck modulation of the upper band).  The mechanism is physical
+  and the effect is one of the strongest distance cues, but the depth depends on
+  wind, temperature gradient and site; the ISO 9613-2 turbulence *absorption*
+  term was deliberately not implemented, because with plausible coefficients it
+  predicts absurd figures (−90 dB at 4 kHz over 300 m) and needs site calibration.  Panel and ground transfer
   are applied as per-band magnitudes with the path delay; their frequency-dependent
   *phase* is not.  Around a coincidence dip or a grass-interference notch the
-  fine comb structure is therefore approximate.
 * **Rectangular rooms only.**  Rooms are boxes; image sources are exact for a box
   and the modal solution is exact for a box.  L-shaped rooms, ceilings with
   reliefs, and furniture geometry are out of scope.

@@ -41,6 +41,9 @@ class Weather:
     pressure_pa: float = P_REF_PA
     wind_speed_ms: float = 0.0
     wind_towards_receiver: float = 1.0     # 1 = tail wind, -1 = head wind
+    #: 0..1 strength of the phase wander eddies put on a long path.  It sets how
+    #: much of the direct/ground interference survives (see _outdoor_paths).
+    turbulence: float = 0.35
 
     @property
     def effective_wind_ms(self) -> float:

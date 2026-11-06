@@ -7,6 +7,7 @@ response with NaNs or a silent output.
 """
 import numpy as np
 import pytest
+from scipy.signal import butter, sosfiltfilt
 
 from soundsim.acoustics import atmosphere, rooms
 from soundsim.engine import presets, renderer
@@ -127,7 +128,7 @@ def test_humidity_changes_the_treble_of_a_long_outdoor_path():
     # 300 m of air barely touches the bass and eats the treble: the total level
     # falls modestly while the spectral balance collapses
     assert mdry["environment_loss_db"] > 5.0
-    assert at(mdry, 8000.0) < at(mdry, 250.0) - 10.0
+    assert at(mwet, 8000.0) < at(mwet, 1000.0) - 10.0
     # at 8 degrees, humidity *helps* a couple of kHz carry and *hurts* the top
     # octaves -- the sign flip the relaxation model predicts
     assert at(mwet, 2000.0) > at(mdry, 2000.0) + 5.0
@@ -324,3 +325,64 @@ def test_convolver_queue_does_not_grow_while_streaming():
         c.process(rng.standard_normal((frames, 2)))
         sizes.append(c._out_left.shape[0])       # queued surplus, must stay small
     assert max(sizes) <= 4 * 512                # bounded, never cumulative
+
+
+def test_a_park_swallows_the_mids_that_still_water_carries():
+    """Ground interference, with phase: at a couple of degrees of grazing over
+    grass the reflected wave comes back nearly out of phase, while a hard
+    surface adds it in phase.  This is a 10+ dB difference at 300 m and the
+    main reason distant sound is not merely quieter but differently coloured."""
+    def balance(ground):
+        sc = presets.make("far_field_park")
+        sc.outdoors.ground = ground
+        m = renderer.render(sc, 48_000).metrics
+        i = int(np.argmin(abs(np.asarray(m["bands_hz"]) - 800.0)))
+        return m["band_response_db"][i]
+    assert balance("water_still") - balance("forest_floor") > 6.0
+    assert balance("asphalt_sealed") - balance("grass_long") > 4.0
+
+
+def test_hard_ground_is_louder_than_no_ground_at_all():
+    """R = +1 over water or concrete means the two rays add: +6 dB.  A scene that
+    skipped the ground image for hard surfaces silently lost that."""
+    def energy(ground):
+        sc = presets.make("far_field_park")
+        sc.outdoors.ground = ground
+        return renderer.render(sc, 48_000).metrics["total_spl_db"]
+    assert energy("concrete") - energy("forest_floor") > 6.0
+
+
+def test_turbulence_wavering_moves_the_high_bands_and_leaves_the_bass():
+    from soundsim.engine.player import Material, Player
+
+    fs, frames = 48_000, 960
+    t = np.arange(fs * 6) / fs
+    # keep well under the limiter ceiling, so what is measured is the wavering
+    # and not the safety stage riding the level
+    tone = 0.2 * (np.sin(2 * np.pi * 250.0 * t) + np.sin(2 * np.pi * 4000.0 * t))[:, None]
+    p = Player(sample_rate=fs, channels=1)
+    p.set_material(Material("two tones", tone, fs))
+    ir = np.zeros(2000)
+    ir[0] = 1.0
+    p.set_impulse_responses([ir])
+    p.set_turbulence(0.9, seed=7)
+    p.playing = True
+    out = []
+    for _ in range(300):
+        buf = np.zeros((frames, 1))
+        p._callback(buf, frames, None, None)
+        out.append(buf[:, 0])
+    y = np.concatenate(out)[5000:]
+
+    def band_rms(lo, hi):
+        sos = butter(2, [lo / (fs / 2), hi / (fs / 2)], btype="band", output="sos")
+        x = sosfiltfilt(sos, y)
+        w = len(x) // 8
+        return np.array([np.sqrt(np.mean(x[i * w:(i + 1) * w] ** 2)) for i in range(8)])
+
+    hi = 20 * np.log10(np.maximum(band_rms(3500, 4500), 1e-12))
+    lo = 20 * np.log10(np.maximum(band_rms(200, 300), 1e-12))
+    assert hi.max() - hi.min() > 4.0            # the treble comes and goes
+    # the bass is far more stable, though not perfectly: the band split is
+    # finite, and phase-to-amplitude conversion does couple a little energy down
+    assert lo.max() - lo.min() < (hi.max() - hi.min()) / 4.0

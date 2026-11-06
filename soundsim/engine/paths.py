@@ -175,17 +175,45 @@ class PathBuilder:
 
         # ---- ground image -----------------------------------------------
         g = self.scene.outdoors.ground_obj()
-        if g.flow_resistivity < 1e9:
+        # Every ground gets its image: a rigid one (asphalt, concrete, still
+        # water) has R = +1, and that +6 dB over the free field is exactly why
+        # sound carries over water and a car park.  Skipping the image for hard
+        # grounds silently turned them into "no ground at all".
+        if True:
             mirror = src.copy()
             mirror[2] = -src[2]
             d_img = float(np.linalg.norm(dst - mirror))
             if d_img > 1e-3:
                 graze = np.arctan2(src[2] + dst[2], max(np.hypot(dst[0] - src[0],
                                                                  dst[1] - src[1]), 1e-6))
-                R = np.abs(gnd.reflection_coefficient(
-                    self.bands, g, np.pi / 2.0 - graze, self.scene.weather.temp_c))
-                paths.append(Path(self.delay(d_img), R * self.spreading(d_img),
-                                  kind="reflection", label="outdoor:ground", order=1))
+                Rc = gnd.reflection_coefficient(
+                    self.bands, g, np.pi / 2.0 - graze, self.scene.weather.temp_c)
+                # keep the reflection phase: over grass or soil the coefficient
+                # rotates by more than 90 deg across the audible band, which puts
+                # the ground ray partly *out of phase* with the direct one.  That
+                # interference -- not the magnitude -- is what carves the midrange
+                # dip that makes 300 m of air sound like 300 m of air.
+                phase = np.angle(Rc)
+                dphi_delay = -phase / (2.0 * np.pi * self.bands)
+                # Turbulence moves the wave front, so the ray path length
+                # wanders by centimetres over fractions of a second.  A static
+                # response cannot wiggle, but it can stop pretending the phase is
+                # known: spreading the reflection over a small range of delays
+                # averages the two-ray pattern by exactly the coherence factor
+                # exp(-sigma_phi^2 / 2), which kills the interference where the
+                # wander exceeds a fraction of a wavelength (high frequencies)
+                # and leaves it intact at low ones.  Without this, a full
+                # coherent comb at 8 kHz makes a lawn sound like a moving
+                # low-pass filter.
+                sigma_m = 0.03 * max(self.scene.weather.turbulence, 0.0)
+                spread = (0.0, -0.9, 0.9, -1.9, 1.9) if sigma_m > 1e-6 else (0.0,)
+                n = len(spread)
+                for k in spread:
+                    paths.append(Path(self.delay(d_img),
+                                      np.abs(Rc) * self.spreading(d_img) / n,
+                                      kind="reflection", label="outdoor:ground",
+                                      order=1,
+                                      delay_bands=dphi_delay + k * sigma_m / self.c))
 
         # ---- screens (Maekawa over the top edge) -------------------------
         for bar in self.scene.barriers:

@@ -28,12 +28,22 @@ from ..acoustics.rooms import decay_curve_db, t60 as measure_t60
 
 @dataclass
 class Path:
-    """One propagation path: a delay plus a per-band pressure gain."""
+    """One propagation path: a delay plus a per-band pressure gain.
+
+    ``delay_bands`` is an optional per-band delay offset in seconds.  It is how a
+    frequency-dependent *phase* enters a band-domain synthesis: a reflection
+    coefficient with phase phi(f) is equivalent, to first order, to the same ray
+    arriving ``-phi/2 pi f`` late.  Porous ground does exactly this -- the wave
+    crawling along a grass surface has a slower phase speed -- and that phase is
+    what turns a plain two-ray sum into the hollow, mid-range-eating colour of
+    real outdoor sound.
+    """
     delay_s: float
-    gains: np.ndarray                 # (n_bands,) pressure gain per band
+    gains: np.ndarray                 # (n_bands,) pressure gain magnitude per band
     kind: str = "direct"              # direct|reflection|transmission|diffraction|aperture
     label: str = ""
     order: int = 0                    # reflection order (for reporting)
+    delay_bands: np.ndarray | None = None
 
     @property
     def energy(self) -> np.ndarray:
@@ -82,7 +92,8 @@ def scatter_paths(paths: list[Path], sample_rate: int, length: int,
         g = pth.gains[band_slice]
         if not np.any(g):
             continue
-        d = pth.delay_s * sample_rate
+        extra = 0.0 if pth.delay_bands is None else float(pth.delay_bands[band_slice][0])
+        d = (pth.delay_s + extra) * sample_rate
         taps, n0 = _lagrange_taps(d)
         idx = n0 + np.arange(4)
         m = (idx >= 0) & (idx < length)
