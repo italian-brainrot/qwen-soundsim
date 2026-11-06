@@ -13,7 +13,7 @@ underlying physics is specified at — 1/3 octave bands.
 ```bash
 python -m soundsim                 # GUI
 python tools/render.py --list      # offline renders, no speaker needed
-pytest -q                          # 42 physics + engine tests
+pytest -q                          # 84 physics, engine and interface tests
 ```
 
 ## What you can do
@@ -21,7 +21,9 @@ pytest -q                          # 42 physics + engine tests
 * 11 environments: party next door, through a closed window, open window at
   night, next room (partition + door), two doors down through a corridor, parked
   car heard outside, inside a car, distant stage in a park, across a room,
-  concrete stairwell, small bedroom.
+  concrete stairwell, small bedroom.  The one in force is named in the bar at
+  the top, and it says so when you have edited it away from its own defaults
+  (**reset** puts them back).
 * Live parameters — source level and its own bass limit, listener distance,
   image-source order, temperature, humidity, wind, ground type — re-render the
   response and **crossfade it into the playing audio**, so a change is heard as
@@ -29,8 +31,22 @@ pytest -q                          # 42 physics + engine tests
 * Plots: impulse response, backward-integrated decay curve, 1/3-octave balance
   against free field, and T60 per band measured on the response plotted against
   the Sabine prediction.
-* Space bar plays/pauses.  Add files or a folder, double-click to play.  The
-  received level and its difference from free field are read out next to the
+* **Audio gets in however you like to work**: type or paste a path — a file, a
+  folder, a `*.glob`, or a whole list of them on separate lines — into the path
+  box and press Enter; or Choose… and paste into the chooser's own path line;
+  or drop files on the window; or Ctrl+V with the track list focused.  The list
+  itself is a splitter pane: drag the handle and it takes half the window if you
+  want.  It has a filter box, the playing row is marked, and the header names
+  the loaded audio with its path, length, rate and channel count.
+* **Prev / Play / Stop / Next / Shuffle / Repeat** along the bottom, with a
+  seek bar across the full width.  Space toggles play, `Alt+Left`/`Alt+Right`
+  step through tracks, `Alt+S` shuffles, `Alt+R` cycles repeat, `Ctrl+O` opens
+  the chooser, and the media keys work.  A track ending by itself hands over to
+  the next one; repeat-one rewinds it instead.  Pausing lets the room's tail ring
+  out but holds the position, so resume picks up where you left it.  The
+  playlist, shuffle, repeat and the last folder are remembered for the next
+  start.
+* The received level and its difference from free field are read out next to the
   measured ISO parameters, together with the Schroeder frequency, so you can see
   when a space is in its modal regime rather than a diffuse one.
 * Stereo is a spaced pair: each channel is an independent physical render with
@@ -189,8 +205,15 @@ response stays at 1 kHz — energy below 40 Hz is 67 dB down, block-rate artefac
 ```
 soundsim/acoustics/   constants, atmosphere, materials, transmission, ground,
                       diffraction, rooms, image_source, modal
-soundsim/engine/      bands, scene, paths, rir, renderer, convolver, player, presets
-soundsim/ui/          Qt main window, QPainter plots
+soundsim/engine/      bands, scene, paths, rir, renderer, convolver, player,
+                      presets, playlist
+soundsim/ui/          Qt main window, playlist and path-first file chooser,
+                      QPainter plots
 tools/render.py       offline WAV rendering
-tests/                test_physics.py (30)  test_engine.py (12)
+tests/                test_physics.py (30)  test_engine.py (24)
+                      test_playlist.py (15)  test_ui.py (15, offscreen)
 ```
+
+The track order and the path expansion live in `engine/` rather than in the
+widgets: which track comes next under shuffle and repeat, and what a pasted line
+of paths turns into, are rules worth pinning down without a display.

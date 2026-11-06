@@ -4,15 +4,24 @@ Deliberately thin: a ring of decoded samples, the partitioned convolver, and a
 PortAudio callback.  The scene impulse response can be replaced at any moment
 (crossfaded inside the convolver), which is what lets you drag a wall's
 thickness or the humidity while the music keeps playing.
+
+Also the home of "what counts as an audio file": the format lists and the
+path/folder scanning the UI needs when you type or paste a location instead of
+clicking through a dialog.
 """
 
 from __future__ import annotations
 
+import glob
 import math
+import os
+import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import sounddevice as sd
@@ -53,6 +62,146 @@ def _libsndfile_formats() -> tuple[str, ...]:
 
 SUPPORTED = _libsndfile_formats()
 NEED_FFMPEG = (".m4a", ".aac", ".mp4", ".opus", ".webm", ".wma")
+
+#: everything that could plausibly be played, whether or not ffmpeg is around
+AUDIO_EXTENSIONS = SUPPORTED + NEED_FFMPEG
+#: a folder scan stops here, so "add ~/Downloads" on a slow disk or a stray
+#: symlink loop cannot hang the UI
+SCAN_LIMIT = 4000
+
+
+def is_audio_file(path: str | os.PathLike[str]) -> bool:
+    return os.path.splitext(str(path))[1].lower() in AUDIO_EXTENSIONS
+
+
+def audio_name_filter() -> str:
+    """A file-dialog filter listing the formats this build can actually open."""
+    pats = " ".join("*" + e for e in AUDIO_EXTENSIONS)
+    return f"Audio ({pats})"
+
+
+def iter_audio_files(root: str | os.PathLike[str], recursive: bool = True,
+                     limit: int = SCAN_LIMIT) -> Iterator[str]:
+    """Audio files under *root*, directory by directory, hidden ones skipped.
+
+    os.walk rather than ``glob("**/*")``: a glob builds the entire list of a
+    media drive before yielding anything, and follows symlink loops.  Here the
+    scan is lazy, ordered, and capped.
+    """
+    root = str(root)
+    n = 0
+    if not os.path.isdir(root):
+        return
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for name in sorted(filenames):
+                if name.startswith(".") or not is_audio_file(name):
+                    continue
+                yield os.path.join(dirpath, name)
+                n += 1
+                if n >= limit:
+                    return
+    else:
+        try:
+            entries = sorted(os.scandir(root), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            if e.name.startswith(".") or not is_audio_file(e.name):
+                continue
+            try:
+                if e.is_file():
+                    yield e.path
+                    n += 1
+                    if n >= limit:
+                        return
+            except OSError:
+                continue
+
+
+def iter_subdirs(root: str | os.PathLike[str]) -> Iterator[str]:
+    """Immediate sub-folders of *root*, sorted, hidden ones skipped."""
+    try:
+        entries = sorted(os.scandir(str(root)), key=lambda e: e.name)
+    except OSError:
+        return
+    for e in entries:
+        if e.name.startswith("."):
+            continue
+        try:
+            if e.is_dir(follow_symlinks=False):
+                yield e.path
+        except OSError:
+            continue
+
+
+def expand_audio_paths(spec: str | Sequence[str], recursive: bool = True,
+                       limit: int = SCAN_LIMIT) -> list[str]:
+    """Turn typed or pasted text into a list of audio files.
+
+    Accepts what people actually paste: one path (with spaces), a newline-
+    separated list copied from a file manager, ``file://`` URLs, shell globs,
+    ``~``-prefixed paths, directories (expanded) and any mix of those.  The
+    result is absolute, de-duplicated, and in the order it was given.
+    """
+    if isinstance(spec, (list, tuple)):
+        tokens = [str(s) for s in spec]
+    else:
+        text = str(spec).strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) > 1:                     # a copied file list
+            tokens = lines
+        else:
+            one = text.strip('"\'')
+            if one and (os.path.exists(os.path.expanduser(one)) or
+                        one.lower().startswith("file://")):
+                tokens = [one]
+            else:
+                tokens = _split_shell(text)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def emit(path: str):
+        p = os.path.abspath(path)
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    for tok in tokens:
+        tok = tok.strip().strip('"\'')
+        if not tok:
+            continue
+        if tok.lower().startswith("file://"):
+            tok = unquote(urlparse(tok).path)
+        tok = os.path.expanduser(os.path.expandvars(tok))
+        if os.path.isdir(tok):
+            for p in iter_audio_files(tok, recursive=recursive, limit=limit):
+                emit(p)
+        elif "*" in tok or "?" in tok or "[" in tok:
+            for p in sorted(glob.glob(tok)):
+                if os.path.isdir(p):
+                    for q in iter_audio_files(p, recursive=recursive, limit=limit):
+                        emit(q)
+                elif is_audio_file(p):
+                    emit(p)
+                if len(out) >= limit:
+                    break
+        elif is_audio_file(tok) and os.path.isfile(tok):
+            emit(tok)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _split_shell(text: str) -> list[str]:
+    """Split one line into path tokens, honouring quotes where there are any."""
+    try:
+        parts = shlex.split(text, posix=True) if any(c in text for c in "'\"") \
+            else text.split()
+    except ValueError:                          # unbalanced quote: take it raw
+        parts = text.split()
+    return [p for p in parts if p]
 
 
 def pick_default_output() -> int | None:
@@ -467,16 +616,20 @@ class Player:
             # faster than real time (2x speed, an octave of pitch shift, and a
             # queue that grows without bound); the latency is simply a fixed
             # delay, which is what output_latency_seconds reports.
-            end = min(self.index + frames, len(self.material.samples))
-            chunk = self.material.samples[self.index:end]
-            self.index = end
-            if len(chunk) < frames:                 # material ran out
-                chunk = np.pad(chunk, ((0, frames - len(chunk)), (0, 0)))
-                if end >= len(self.material.samples):
-                    self.playing = False
-            if not self.playing:
-                # the material is silent but the room is not: keep feeding zeros
-                # so the tail rings out instead of being cut off
+            if self.playing:
+                end = min(self.index + frames, len(self.material.samples))
+                chunk = self.material.samples[self.index:end]
+                self.index = end
+                if len(chunk) < frames:             # material ran out
+                    chunk = np.pad(chunk, ((0, frames - len(chunk)), (0, 0)))
+                    if end >= len(self.material.samples):
+                        self.playing = False
+            else:
+                # Paused: the material is silent but the room is not, so keep
+                # feeding zeros for the tail -- but do *not* advance the read
+                # position.  Consuming samples while muted is what made the seek
+                # bar creep along during a pause and "resume" pick up a minute
+                # later where nothing had been heard.
                 chunk = np.zeros((frames, self.channels))
             chunk = self._match_channels(chunk, self.channels)
             out = self.limit(self._turbulence(self.conv.process(chunk) * self.gain))

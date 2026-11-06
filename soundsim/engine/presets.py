@@ -116,7 +116,7 @@ def next_room(distance_in_next: float = 3.0, open_doorway: bool = False) -> Scen
         "south": "brick_painted", "north": "brick_painted",
     }, contents=[("carpet_thin", 10.0), ("upholstered_chair", 3.0),
                  ("curtain_heavy", 5.0)])
-    return Scene(
+    sc = Scene(
         name="Next room (partition + doorway)",
         description=("Stereo behind a gypsum partition with a doorway; the "
                      "listener's own room adds its own reverberation on top."),
@@ -138,10 +138,10 @@ def next_room(distance_in_next: float = 3.0, open_doorway: bool = False) -> Scen
         ],
         weather=WARM, ism_order=6)
     if open_doorway:
-        scene.couplings.append(Coupling("aperture", 1.9 * 0.9, (5.0, 0.95, 1.0),
-                                       (1, 0, 0), "source_room", "listen_room",
-                                       label="open doorway"))
-    return scene
+        sc.couplings.append(Coupling("aperture", 1.9 * 0.9, (5.0, 0.95, 1.0),
+                                     (1, 0, 0), "source_room", "listen_room",
+                                     label="open doorway"))
+    return sc
 
 
 def across_the_corridor() -> Scene:

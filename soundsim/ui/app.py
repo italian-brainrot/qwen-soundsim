@@ -1,36 +1,41 @@
 """SoundSim desktop application.
 
-Layout: scene presets on the left, four plots in the middle (impulse response,
-decay curve, 1/3-octave balance, reverberation time per band), the physical
-parameters on the right, transport along the bottom.  Changing any parameter
-re-renders the room impulse response and crossfades it into the live audio, so
-the effect of the physics is heard as a transition rather than as a before/after
-comparison.
+Layout: scene presets on the left, the now-playing bar and four plots in the
+middle (impulse response, decay curve, 1/3-octave balance, reverberation time
+per band) with the track list under them, the physical parameters on the right,
+transport along the bottom.  Changing any parameter re-renders the room impulse
+response and crossfades it into the live audio, so the effect of the physics is
+heard as a transition rather than as a before/after comparison.
+
+The track list lives in a splitter, so it can be as big as you want, and audio
+gets in by every route that takes text: a typed or pasted path, a chooser you
+can type into, drag and drop, and Ctrl+V.
 """
 
 from __future__ import annotations
 
-import glob
 import os
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from scipy.signal import butter, sosfiltfilt
 
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QMainWindow,
-    QPushButton, QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QMainWindow, QPushButton, QSlider, QSpinBox,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..acoustics.materials import GROUNDS
 from ..engine import presets, renderer
-from ..engine.player import SUPPORTED
-from ..engine.player import (NEED_FFMPEG, Player, demo_material,
-                              load_file, pick_default_output)
+from ..engine.player import (SCAN_LIMIT, SUPPORTED, Player, demo_material,
+                             expand_audio_paths, load_file, pick_default_output)
+from ..engine.playlist import Playlist
 from ..engine.scene import Scene
+from .media import DIM, PlaylistPanel, apply_dark_theme
 from .plots import Plot
 
 PARAM_LABELS = {
@@ -47,6 +52,11 @@ PARAM_LABELS = {
     "ir_cap": "Response length cap (s)",
     "delay_comp": "Compensate propagation delay (non-physical)",
 }
+
+
+# renders still running when the window closes; kept referenced until they
+# finish, because destroying a live QThread aborts the process
+_ORPHANS: list = []
 
 
 class RenderWorker(QThread):
@@ -75,28 +85,39 @@ class RenderWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
+        apply_dark_theme(self)
         self.setWindowTitle("SoundSim — acoustic environment simulator")
         self.resize(1360, 860)
         self.sample_rate = 48_000
         self.player = Player(sample_rate=self.sample_rate, channels=2,
                              device=pick_default_output())
-        self.scene: Scene = presets.make("party_next_door")
+        self.scene_key = "party_next_door"
+        self.scene: Scene = presets.make(self.scene_key)
         self.base_distance = self._listener_distance()
         self.last_result = None
         self.worker: RenderWorker | None = None
         self.pending = []
-        self.playlist: list[str] = []
+        self.tracks = Playlist()
+        self.scene_edited = False
+        self._was_playing = False
+        # injectable so the tests can start from an empty state file
+        self.settings = settings or QSettings("SoundSim", "SoundSim")
 
         self._build_ui()
-        self._load_material(demo_material(sample_rate=self.sample_rate))
+        self._restore_session()
+        if self.player.material is None:
+            self._load_material(demo_material(sample_rate=self.sample_rate))
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.timeout.connect(self._start_render)
         self.request_render()
+        # the position readout, the level meter and the end-of-track hand-off
+        # all ride on this tick; it used to be created and never started
         self._tick = QTimer(self, interval=60)
         self._tick.timeout.connect(self._poll_player)
+        self._tick.start()
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -110,20 +131,72 @@ class MainWindow(QMainWindow):
         for key, (title, sub) in presets.PRESETS.items():
             self.scene_list.addItem(f"{title}")
         self.scene_list.currentRowChanged.connect(self._pick_preset)
+        self.scene_list.blockSignals(True)
+        self.scene_list.setCurrentRow(list(presets.PRESETS).index(self.scene_key))
+        self.scene_list.blockSignals(False)
         self.scene_desc = QLabel(self.scene.description)
         self.scene_desc.setWordWrap(True)
         self.scene_desc.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        left.addWidget(QLabel("<b>Environment</b>"))
+        env_head = QHBoxLayout()
+        env_head.addWidget(QLabel("<b>Environment</b>"))
+        env_head.addStretch(1)
+        self.btn_reset_env = QPushButton("reset")
+        self.btn_reset_env.setToolTip("Put this environment's own numbers back. "
+                                      "Enabled once a physics control has been "
+                                      "moved; double-clicking the environment in "
+                                      "the list does the same.")
+        self.btn_reset_env.setEnabled(False)
+        self.btn_reset_env.clicked.connect(
+            lambda: self._pick_preset(self.scene_list.currentRow()))
+        env_head.addWidget(self.btn_reset_env)
+        self.scene_list.itemDoubleClicked.connect(
+            lambda it: self._pick_preset(self.scene_list.currentRow()))
+        left.addLayout(env_head)
         left.addWidget(self.scene_list, 1)
         left.addWidget(self.scene_desc)
 
-        # ---- middle: plots + transport ----------------------------------
-        self.plot_ir = Plot(title="Impulse response", ylabel="dB")
-        self.plot_decay = Plot(title="Decay curve (backward integration)", ylabel="dB")
+        # ---- middle: what is playing, the plots, the playlist ------------
+        now = QFrame()
+        now.setObjectName("nowbar")
+        now.setStyleSheet("QFrame#nowbar { background:#242832; border:1px solid "
+                          "#39414d; border-radius:6px; }")
+        bar = QHBoxLayout(now)
+        bar.setContentsMargins(10, 6, 10, 6)
+        bar.setSpacing(10)
+        glyph = QLabel("\u266a")
+        glyph.setStyleSheet("font-size:20px; color:#6fb3ff;")
+        bar.addWidget(glyph)
+        who = QVBoxLayout()
+        who.setSpacing(1)
+        self.track_title = QLabel("no audio loaded")
+        self.track_title.setStyleSheet(
+            "font-size:15px; font-weight:600; color:#e6ebf2;")
+        self.track_sub = QLabel("")
+        self.track_sub.setStyleSheet(f"font-size:11px; color:{DIM};")
+        who.addWidget(self.track_title)
+        who.addWidget(self.track_sub)
+        bar.addLayout(who, 1)
+        where = QVBoxLayout()
+        where.setSpacing(1)
+        self.env_name = QLabel("")
+        self.env_name.setAlignment(Qt.AlignRight)
+        self.env_name.setStyleSheet(
+            "font-size:15px; font-weight:600; color:#f0c070;")
+        self.env_sub = QLabel("")
+        self.env_sub.setAlignment(Qt.AlignRight)
+        self.env_sub.setStyleSheet(f"font-size:11px; color:{DIM};")
+        where.addWidget(self.env_name)
+        where.addWidget(self.env_sub)
+        bar.addSpacing(12)
+        bar.addLayout(where)
+
+        self.plot_ir = Plot(title="Impulse response", xlabel="ms")
+        self.plot_decay = Plot(title="Decay curve (backward integration)",
+                               xlabel="ms")
         self.plot_bands = Plot(title="Band balance vs free field", xlog=True,
-                               ylabel="dB")
+                               xlabel="Hz")
         self.plot_t60 = Plot(title="Reverberation time per band", xlog=True,
-                             ylabel="s")
+                             xlabel="Hz")
         grid = QWidget()
         g = QGridLayout(grid)
         g.setContentsMargins(0, 0, 0, 0)
@@ -132,37 +205,83 @@ class MainWindow(QMainWindow):
         g.addWidget(self.plot_bands, 1, 0)
         g.addWidget(self.plot_t60, 1, 1)
 
-        transport = QHBoxLayout()
-        self.btn_play = QPushButton("Play")
-        self.btn_play.setShortcut(QKeySequence(Qt.Key_Space))
-        self.btn_play.clicked.connect(self._toggle_play)
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.clicked.connect(self._stop)
-        self.btn_files = QPushButton("Add files…")
-        self.btn_files.clicked.connect(self._add_files)
-        self.btn_folder = QPushButton("Add folder…")
-        self.btn_folder.clicked.connect(self._add_folder)
+        self.panel = PlaylistPanel()
+        self.panel.activate_row.connect(self._activate_row)
+        self.panel.add_paths.connect(self._add_paths)
+        self.panel.remove_rows.connect(self._remove_rows)
+        self.panel.clear_list.connect(self._clear_playlist)
+
+        # the track list is a splitter pane, not a strip: drag the handle and it
+        # takes whatever room you want, plots and all
+        self.stack = QSplitter(Qt.Vertical)
+        self.stack.addWidget(grid)
+        self.stack.addWidget(self.panel)
+        self.stack.setCollapsible(0, False)
+        self.stack.setCollapsible(1, False)
+        self.stack.setHandleWidth(10)
+        self.stack.setSizes([560, 300])
+
+        # two rows: the seek bar gets the whole width it needs, the buttons
+        # their own room, instead of each other's leftovers
+        seekrow = QHBoxLayout()
         self.seek = QSlider(Qt.Horizontal)
         self.seek.setRange(0, 1000)
         self.seek.sliderMoved.connect(self._seek)
+        self.seek.setToolTip("Click or drag to move inside the track")
         self.time_label = QLabel("0:00 / 0:00")
+        seekrow.addWidget(self.time_label)
+        seekrow.addWidget(self.seek, 1)
+
+        transport = QHBoxLayout()
+        transport.setSpacing(6)
+        self.btn_prev = QPushButton("\u25c0 Prev")
+        self.btn_prev.setToolTip("Previous track (Alt+Left) — at less than 3 s "
+                                 "into a track it goes back a track, after that "
+                                 "it restarts this one, as everywhere else")
+        self.btn_prev.clicked.connect(lambda: self._skip(-1))
+        self.btn_play = QPushButton("\u25b6 Play")
+        self.btn_play.setToolTip("Play / pause (Space)")
+        self.btn_play.clicked.connect(self._toggle_play)
+        self.btn_stop = QPushButton("\u25a0 Stop")
+        self.btn_stop.setToolTip("Stop and rewind")
+        self.btn_stop.clicked.connect(self._stop)
+        self.btn_next = QPushButton("Next \u25b6")
+        self.btn_next.setToolTip("Next track (Alt+Right)")
+        self.btn_next.clicked.connect(lambda: self._skip(1))
+        self.btn_shuffle = QPushButton("Shuffle")
+        self.btn_shuffle.setCheckable(True)
+        self.btn_shuffle.setToolTip("Play in random order (Alt+S). The current "
+                                    "track stays where it is; files added while "
+                                    "playing are dealt in ahead of the cursor.")
+        self.btn_shuffle.toggled.connect(self._toggle_shuffle)
+        self.btn_repeat = QPushButton("Repeat: off")
+        self.btn_repeat.setToolTip("Cycle off / all / one (Alt+R). \u201cone\u201d "
+                                    "rewinds the track when it reaches its end; "
+                                    "skipping forward still moves on.")
+        self.btn_repeat.clicked.connect(self._cycle_repeat)
+        for b, w in ((self.btn_prev, 76), (self.btn_play, 86),
+                     (self.btn_stop, 76), (self.btn_next, 76),
+                     (self.btn_shuffle, 76), (self.btn_repeat, 104)):
+            b.setMinimumWidth(w)
+        self.counter = QLabel("0 / 0")
+        self.counter.setToolTip("Position in the playlist / how many tracks")
+        self.counter.setStyleSheet(f"color:{DIM};")
         self.level = QLabel("")
         self.level.setMinimumWidth(150)
+        transport.addWidget(self.btn_prev)
         transport.addWidget(self.btn_play)
         transport.addWidget(self.btn_stop)
-        transport.addWidget(self.btn_files)
-        transport.addWidget(self.btn_folder)
-        transport.addWidget(self.seek, 1)
-        transport.addWidget(self.time_label)
+        transport.addWidget(self.btn_next)
+        transport.addWidget(self.btn_shuffle)
+        transport.addWidget(self.btn_repeat)
+        transport.addStretch(1)
+        transport.addWidget(self.counter)
         transport.addWidget(self.level)
 
-        self.playlist_view = QListWidget()
-        self.playlist_view.setMaximumHeight(88)
-        self.playlist_view.itemDoubleClicked.connect(self._open_playlist_item)
-
         middle = QVBoxLayout()
-        middle.addWidget(grid, 3)
-        middle.addWidget(self.playlist_view, 0)
+        middle.addWidget(now)
+        middle.addWidget(self.stack, 1)
+        middle.addLayout(seekrow)
         middle.addLayout(transport)
 
         # ---- right: parameters + metrics ---------------------------------
@@ -218,12 +337,12 @@ class MainWindow(QMainWindow):
                   self.in_rh, self.in_wind, self.in_ground, self.in_turb,
                   self.in_waver, self.in_cap):
             if isinstance(w, QComboBox):
-                w.currentTextChanged.connect(self.request_render)
+                w.currentTextChanged.connect(self._param_changed)
             else:
-                w.valueChanged.connect(self.request_render)
+                w.valueChanged.connect(self._param_changed)
         self.in_lowcut.currentIndexChanged.connect(lambda *_: self._apply_monitoring())
         for w in (self.in_tail, self.in_modal):          # physics: re-render
-            w.toggled.connect(self.request_render)
+            w.toggled.connect(self._param_changed)
         for w in (self.in_delay, self.in_auto_gain):     # monitoring only
             w.toggled.connect(lambda *_: self._apply_monitoring())
         form.addRow(PARAM_LABELS["spl"], self.in_spl)
@@ -287,8 +406,13 @@ class MainWindow(QMainWindow):
         w1.setLayout(left); w2.setLayout(middle); w3.setLayout(right)
         splitter.addWidget(w1); splitter.addWidget(w2); splitter.addWidget(w3)
         splitter.setSizes([230, 760, 330])
+        self.splitter = splitter
         root.addWidget(splitter)
 
+        self.setAcceptDrops(True)
+        self._install_shortcuts()
+        self._update_env_label()
+        self._refresh_playlist_view()
         self._refresh_plots(None)
 
     # ------------------------------------------------------------------
@@ -311,6 +435,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         name = list(presets.PRESETS)[row]
+        self.scene_key = name
         self.scene = presets.make(name)
         self.scene.diffuse_tail = self.in_tail.isChecked()
         self.base_distance = self._listener_distance()
@@ -344,7 +469,39 @@ class MainWindow(QMainWindow):
             self.in_turb.setCurrentIndex(row)
         self.in_turb.blockSignals(False)
         self.scene_desc.setText(self.scene.description)
+        self.scene_edited = False
+        self._update_env_label()
         self.request_render()
+
+    def _param_changed(self, *args):
+        """A physics control moved: the scene is no longer the preset as shipped."""
+        self.scene_edited = True
+        self._update_env_label()
+        self.request_render()
+
+    def _update_env_label(self):
+        """Say which environment is applied, and whether it has been edited."""
+        title, sub = presets.PRESETS.get(self.scene_key,
+                                         (self.scene.name, ""))
+        self.env_name.setText(title + (" \u00b7 edited" if self.scene_edited
+                                       else ""))
+        self.env_name.setToolTip(
+            self.scene.description +
+            ("\n\nSome physics control differs from this environment's "
+             "defaults. Selecting it again in the list resets them."
+             if self.scene_edited else ""))
+        self.env_sub.setText("environment — " + sub)
+        self.btn_reset_env.setEnabled(self.scene_edited)
+        self._update_window_title()
+
+    def _update_window_title(self):
+        """The title bar names both, so alt-tab says what is what."""
+        m = self.player.material
+        track = "" if m is None else (os.path.basename(m.path) if m.path
+                                      else m.name)
+        title, _ = presets.PRESETS.get(self.scene_key, (self.scene.name, ""))
+        self.setWindowTitle(f"{track} — {title} — SoundSim" if track
+                            else "SoundSim — acoustic environment simulator")
 
     def _build_scene(self) -> Scene:
         sc = self.scene
@@ -493,30 +650,61 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     # transport
-    def _load_material(self, mat):
+    def _say(self, text: str, bad: bool = False):
+        """One status line, colour-coded: it is the only feedback channel."""
+        self.status.setText(text)
+        self.status.setStyleSheet("color:" + ("#e07a7a;" if bad else "#7fd18a;"))
+
+    def _load_material(self, mat) -> bool:
         """Never let a bad decode leave the transport pointing at nothing."""
         try:
             self.player.set_material(mat)
         except Exception as exc:
-            self.status.setText(f"could not play {getattr(mat, 'name', '?')}: {exc}")
-            self.status.setStyleSheet("color:#e07a7a;")
-            return
+            self._say(f"could not play {getattr(mat, 'name', '?')}: {exc}",
+                      bad=True)
+            return False
         self.seek.setValue(0)
+        # the monitor gain is derived from the material's own peak, so new
+        # material means the (unchanged) response has to be re-applied to it
+        self._apply_monitoring()
+        self._update_now_playing()
         self._poll_player()
+        return True
+
+    def _load_path(self, path: str) -> bool:
+        """Decode a playlist entry and hand it to the transport."""
+        try:
+            mat = load_file(path, self.sample_rate)
+        except Exception as exc:
+            self._say(f"cannot decode {os.path.basename(path)}: {exc}", bad=True)
+            return False
+        return self._load_material(mat)
+
+    def _update_play_button(self):
+        self.btn_play.setText("\u2016 Pause" if self.player.playing
+                              else "\u25b6 Play")
 
     def _toggle_play(self):
         try:
             self.player.toggle()
         except Exception as exc:
-            self.status.setText(f"cannot start audio: {exc}")
-            self.status.setStyleSheet("color:#e07a7a;")
+            self._say(f"cannot start audio: {exc}", bad=True)
             return
-        self.btn_play.setText("Pause" if self.player.playing else "Play")
+        self._update_play_button()
+
+    def _start_playback(self):
+        """Resume after loading a track while the transport was running."""
+        try:
+            self.player.play()
+        except Exception as exc:
+            self._say(f"cannot start audio: {exc}", bad=True)
+        self._update_play_button()
 
     def _stop(self):
         self.player.pause()
         self.player.set_position_seconds(0)
-        self.btn_play.setText("Play")
+        self._was_playing = False
+        self._update_play_button()
 
     def _seek(self):
         frac = self.seek.value() / 1000.0
@@ -533,37 +721,269 @@ class MainWindow(QMainWindow):
         self.level.setText("▮" * bars + f" {db:.0f} dB" +
                            ("  LIMIT" if self.player.clip_flag else ""))
         if self.player.error:
-            self.status.setText(self.player.error)
-            self.status.setStyleSheet("color:#e07a7a;")
+            self._say(self.player.error, bad=True)
+        # the callback stops itself when the material runs out: that is the cue
+        # to do what shuffle and repeat say, not a reason to simply go quiet
+        mat = self.player.material
+        ended = (mat is not None and self._was_playing and not self.player.playing
+                 and self.player.index >= len(mat.samples))
+        self._was_playing = self.player.playing
+        if ended:
+            self._advance()
 
-    def _open_playlist_item(self, item):
-        try:
-            self._load_material(load_file(item.text(), self.sample_rate))
-        except Exception as exc:
-            self.status.setText(f"cannot decode {os.path.basename(item.text())}: {exc}")
-            self.status.setStyleSheet("color:#e07a7a;")
+    # ------------------------------------------------------------------
+    # which audio: putting things in, picking them, stepping through them
+    def _add_paths(self, specs):
+        """Typed, pasted or dropped text -> tracks.
 
-    def _add_files(self):
-        pats = " ".join("*" + e for e in SUPPORTED) + " " + " ".join("*" + e for e in NEED_FFMPEG)
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Add audio", os.path.expanduser("~"), f"Audio ({pats})")
-        self._extend_playlist(files)
-
-    def _add_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Add folder", os.path.expanduser("~"))
-        if not d:
+        One route for all of them, because each can carry a file, a folder, a
+        glob or a whole pasted list, and which one happened to be used should
+        not change what ends up in the list.
+        """
+        joined = "\n".join(str(s) for s in
+                           ([specs] if isinstance(specs, str) else list(specs)))
+        if not joined.strip():
             return
-        exts = tuple(SUPPORTED) + tuple(NEED_FFMPEG)
-        files = sorted(f for f in glob.glob(os.path.join(d, "**", "*"), recursive=True)
-                       if f.lower().endswith(exts))
-        self._extend_playlist(files)
+        paths = expand_audio_paths(joined)
+        if not paths:
+            self._say("no playable file found in: " + _clip(joined, 60), bad=True)
+            return
+        was_empty = not self.tracks
+        added = self.tracks.add(paths)
+        self.panel.remember(paths[0])
+        if was_empty and added:
+            self.tracks.jump_to(added[0])
+            self._load_path(added[0])
+        self._refresh_playlist_view()
+        if not added:
+            self._say(f"those {len(paths)} tracks are already in the list")
+            return
+        note = f"added {len(added)} track" + ("s" if len(added) != 1 else "")
+        if len(paths) >= SCAN_LIMIT:
+            note += f" — the folder scan is capped at {SCAN_LIMIT}"
+        self._say(note)
 
-    def _extend_playlist(self, files):
-        for f in files:
-            self.playlist_view.addItem(f)
-        if files and not self.playlist:
-            self._load_material(load_file(files[0], self.sample_rate))
-        self.playlist.extend(files)
+    def _refresh_playlist_view(self):
+        """Mirror the model into the list, the note and the counter."""
+        self.panel.set_paths(self.tracks.items)
+        self.panel.set_current(self.tracks.index)
+        n = len(self.tracks)
+        cur = self.tracks.index
+        self.panel.set_note(
+            f"{n} track" + ("s" if n != 1 else "") +
+            (f" · playing {cur + 1}" if cur is not None else ""))
+        self.counter.setText(f"{(cur + 1) if cur is not None else 0} / {n}")
+
+    def _activate_row(self, index: int):
+        """Double-click or Enter in the list: play that row, whatever the
+        transport was doing before."""
+        self._play_row(index, resume=True)
+
+    def _play_row(self, index: int, resume: bool | None = None):
+        """Load the track at a row.  *resume* True starts it, None leaves the
+        transport as it was, False leaves it paused."""
+        path = self.tracks.path_at(index)
+        if path is None:
+            return
+        self.tracks.select(index)
+        if not self._load_path(path):
+            return
+        self.panel.set_current(self.tracks.index)
+        self._refresh_playlist_view()
+        if resume or (resume is None and (self.player.playing or
+                                          self._was_playing)):
+            self._start_playback()
+        else:
+            self._update_play_button()
+
+    def _skip(self, direction: int):
+        """Prev / next.  Repeat-one never traps a deliberate skip."""
+        if not self.tracks:
+            self._say("nothing in the playlist yet — type a path above")
+            return
+        if direction < 0 and self.player.position_seconds > 3.0:
+            self.player.set_position_seconds(0.0)     # back to the top first
+            self.seek.setValue(0)
+            return
+        resume = self.player.playing or self._was_playing
+        path = self.tracks.next() if direction > 0 else self.tracks.prev()
+        if path is None:
+            self._refresh_playlist_view()
+            self._say("at the " + ("last" if direction > 0 else "first") +
+                      " track — repeat is off")
+            return
+        self._play_row(self.tracks.index, resume=resume)
+
+    def _advance(self):
+        """A track ended by itself: shuffle and repeat decide what is next."""
+        path = self.tracks.next(auto=True)
+        if path is None:
+            self._update_play_button()
+            self._refresh_playlist_view()
+            self.status.setText("end of the playlist")
+            self.status.setStyleSheet(f"color:{DIM};")
+            return
+        if self._load_path(path):
+            self.panel.set_current(self.tracks.index)
+            self._refresh_playlist_view()
+            self._start_playback()
+
+    def _toggle_shuffle(self, on: bool):
+        self.tracks.set_shuffle(on)
+        self.panel.set_current(self.tracks.index)
+        self._accent(self.btn_shuffle, on)
+        self._say("playing in random order" if on else "playing in the order added")
+
+    def _cycle_repeat(self):
+        mode = self.tracks.cycle_repeat()
+        self.btn_repeat.setText(f"Repeat: {mode}")
+        self._accent(self.btn_repeat, mode != "off")
+        self._say(f"repeat {mode}")
+
+    def _accent(self, button, on: bool):
+        """Fusion's 'checked' is a sunken grey; on transport buttons that reads
+        as disabled, so an active mode is marked with the accent colour."""
+        button.setStyleSheet("background:#3a6ea5; color:#ffffff; "
+                             "border-color:#4d84c0;" if on else "")
+
+    def _remove_rows(self, rows):
+        self.tracks.remove(rows)
+        self._refresh_playlist_view()
+        self._say(f"removed {len(rows)} track" + ("s" if len(rows) != 1 else ""))
+
+    def _clear_playlist(self):
+        self.tracks.clear()
+        self._refresh_playlist_view()
+        self._say("playlist cleared — the loaded track keeps playing")
+
+    def _update_now_playing(self):
+        """What the transport is holding, where it came from and in what shape.
+        Without this the four plots have no stated subject."""
+        m = self.player.material
+        if m is None:
+            self.track_title.setText("no audio loaded")
+            self.track_sub.setText("type a path below, or press Play for the "
+                                   "built-in demo material")
+            self.track_title.setToolTip("")
+            self._update_window_title()
+            return
+        chans = m.samples.shape[1] if m.samples.ndim > 1 else 1
+        self.track_title.setText(_clip(os.path.basename(m.path) if m.path
+                                       else m.name, 70))
+        self.track_title.setToolTip(m.path or "built-in demo material")
+        need_ffmpeg = bool(m.path) and \
+            os.path.splitext(m.path)[1].lower() not in SUPPORTED
+        self.track_sub.setText(
+            (_clip(os.path.dirname(m.path), 70) if m.path
+             else "built into the app") +
+            f"  ·  {_mmss(m.duration)}  ·  {m.sample_rate / 1000.0:g} kHz  ·  " +
+            ("mono" if chans == 1 else "stereo" if chans == 2
+             else f"{chans} channels") +
+            ("  ·  decoded via ffmpeg" if need_ffmpeg else ""))
+        self._update_window_title()
+
+    # ------------------------------------------------------------------
+    # keys
+    def _install_shortcuts(self):
+        """Transport keys, switched off while a text box has the focus."""
+        self._shortcuts = []
+
+        def add(seq, fn):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(fn)
+            self._shortcuts.append(sc)
+
+        add(Qt.Key_Space, self._toggle_play)
+        add(QKeySequence(Qt.Key_MediaPlay), self._toggle_play)
+        add(QKeySequence(Qt.Key_MediaTogglePlayPause), self._toggle_play)
+        add(QKeySequence(Qt.Key_MediaStop), self._stop)
+        add(QKeySequence(Qt.Key_MediaNext), lambda: self._skip(1))
+        add(QKeySequence(Qt.Key_MediaPrevious), lambda: self._skip(-1))
+        add("Alt+Right", lambda: self._skip(1))
+        add("Alt+Left", lambda: self._skip(-1))
+        add("Alt+S", self.btn_shuffle.click)
+        add("Alt+R", self._cycle_repeat)
+        add("Ctrl+O", self.panel.btn_add.click)
+        add("Ctrl+Shift+O", self.panel.btn_folder.click)
+        add("Ctrl+F", self.panel.filter_box.setFocus)
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._typing_focus)
+
+    def _typing_focus(self, _old, now):
+        """While you are typing a path, Space is a space and not Play."""
+        typing = isinstance(now, (QLineEdit, QAbstractSpinBox))
+        for sc in self._shortcuts:
+            sc.setEnabled(not typing)
+
+    # ------------------------------------------------------------------
+    # session: the list, and where it came from, kept for the next start
+    def _restore_session(self):
+        s = self.settings
+        items = s.value("playlist") or []
+        if isinstance(items, str):
+            items = [items]
+        items = [str(p) for p in items if os.path.isfile(str(p))]
+        self.panel.set_context(str(s.value("last_dir", os.path.expanduser("~"))),
+                               [str(d) for d in (s.value("recent_dirs") or [])])
+        self.tracks.add(items)
+        self.tracks.set_repeat(str(s.value("repeat", "off")))
+        self.btn_repeat.setText(f"Repeat: {self.tracks.repeat}")
+        if self.tracks.repeat != "off":
+            self._accent(self.btn_repeat, True)
+        shuffle = str(s.value("shuffle", "false")).lower() in ("1", "true", "yes")
+        self.btn_shuffle.setChecked(shuffle)
+        self.tracks.set_shuffle(shuffle)
+        try:
+            cur = int(s.value("current_index", 0))
+        except (TypeError, ValueError):
+            cur = 0
+        if self.tracks:
+            self.tracks.select(cur)
+            if self.tracks.current():
+                self._load_path(self.tracks.current())
+        self._refresh_playlist_view()
+        self._restore_splitter_sizes()
+
+    def _save_session(self):
+        s = self.settings
+        s.setValue("playlist", self.tracks.items)
+        s.setValue("current_index", self.tracks.index or 0)
+        s.setValue("shuffle", self.tracks.shuffle)
+        s.setValue("repeat", self.tracks.repeat)
+        s.setValue("last_dir", self.panel.last_dir)
+        s.setValue("recent_dirs", self.panel.recents)
+        s.setValue("split_main", self.splitter.sizes())
+        s.setValue("split_audio", self.stack.sizes())
+        s.sync()
+
+    def _restore_splitter_sizes(self):
+        """Whoever arranged the panes was probably trying to see something."""
+        for key, pane, want in (("split_main", self.splitter, [230, 760, 330]),
+                                ("split_audio", self.stack, [560, 300])):
+            sizes = self.settings.value(key) or []
+            try:
+                sizes = [int(v) for v in sizes]
+            except (TypeError, ValueError):
+                sizes = []
+            if len(sizes) == pane.count() and all(v > 0 for v in sizes):
+                pane.setSizes(sizes)
+            else:
+                pane.setSizes(want)
+
+    # ------------------------------------------------------------------
+    # a file or folder dropped anywhere on the window
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() or event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        text = ("\n".join(u.toLocalFile() for u in md.urls() if u.isLocalFile())
+                if md.hasUrls() else md.text())
+        if text.strip():
+            self._add_paths(text.splitlines())
+            event.acceptProposedAction()
 
     def _pick_device(self):
         """Switch the output device, and say so if the box refuses it."""
@@ -593,11 +1013,17 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):
+        self._save_session()
         self.player.stop_stream()
         if self.worker is not None and self.worker.isRunning():
             self.worker.requestInterruption()
             self.worker.quit()
-            self.worker.wait(4000)
+            if not self.worker.wait(4000):
+                worker = self.worker
+                _ORPHANS.append(worker)
+                worker.finished.connect(
+                    lambda: _ORPHANS.remove(worker) if worker in _ORPHANS
+                    else None)
         event.accept()
 
 
@@ -641,6 +1067,15 @@ def _fmt(v) -> str:
     return f"{v:.1f}" if abs(v) < 100 else f"{v:.0f}"
 
 
+def _clip(text: str, width: int = 60) -> str:
+    """Shorten in the middle-ish: the end of a path is the part that matters."""
+    text = " ".join(str(text).split())
+    if len(text) <= width:
+        return text
+    head = width // 3
+    return text[:head] + "…" + text[-(width - head - 1):]
+
+
 def _mmss(s: float) -> str:
     s = max(0.0, float(s))
     return f"{int(s) // 60}:{int(s) % 60:02d}"
@@ -649,7 +1084,16 @@ def _mmss(s: float) -> str:
 def run() -> int:                                     # pragma: no cover
     import sys
     app = QApplication(sys.argv)
+    # QSettings is where the playlist and the last folder live between runs
+    app.setOrganizationName("SoundSim")
+    app.setApplicationName("SoundSim")
+    apply_dark_theme(app)
     win = MainWindow()
     win.show()
-    return app.exec()
+    code = app.exec()
+    # a render that was still going when the window closed: give it a moment to
+    # land before the interpreter starts pulling the rug out from under it
+    for worker in list(_ORPHANS):
+        worker.wait(3000)
+    return code
 

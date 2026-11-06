@@ -386,3 +386,53 @@ def test_turbulence_wavering_moves_the_high_bands_and_leaves_the_bass():
     # the bass is far more stable, though not perfectly: the band split is
     # finite, and phase-to-amplitude conversion does couple a little energy down
     assert lo.max() - lo.min() < (hi.max() - hi.min()) / 4.0
+
+
+def drive(player, blocks, frames=256):
+    """Run the PortAudio callback by hand; returns its last block."""
+    out = np.zeros((frames, 2))
+    for _ in range(blocks):
+        player._callback(out, frames, None, None)
+    return out
+
+
+def test_pausing_freezes_the_read_position():
+    """The callback kept consuming the material while paused (replacing it with
+    silence), so the position crept along, the seek bar moved, and "resume"
+    picked up where nothing had been heard."""
+    p = Player(sample_rate=48_000, channels=2)
+    p.start = lambda: None                  # drive the callback, not a device
+    p.set_impulse_responses([np.array([1.0, 0.5, 0.25])] * 2, crossfade_s=0.001)
+    p.set_material(Material("t", np.ones((48_000, 2)), 48_000))
+    p.playing = True
+    drive(p, 4)
+    assert p.index == 4 * 256
+    p.pause()
+    out = drive(p, 2)                                  # the room is still ringing
+    assert np.abs(out[-1]).max() > 0.0
+    out = drive(p, 18)
+    assert p.index == 4 * 256                          # the position held still
+    assert np.abs(out[-1]).max() == 0.0                # nothing new came through
+    p.play()
+    drive(p, 4)
+    assert p.index == 8 * 256                          # resumes where it stopped
+
+
+def test_a_track_running_out_still_stops_the_transport_by_itself():
+    """The other half of the same code: at the end of the material the callback
+    has to stop itself, which is what the UI uses to advance the playlist."""
+    p = Player(sample_rate=48_000, channels=2)
+    p.set_material(Material("t", np.ones((1000, 2)), 48_000))
+    p.playing = True                      # no output device: the callback itself
+    drive(p, 8)
+    assert p.index == 1000 and not p.playing
+
+
+def test_the_open_door_variant_of_the_next_room_builds():
+    """This raised NameError: the Scene was returned from inside the call, so
+    the extra aperture had nothing to be attached to."""
+    sc = presets.make("next_room", open_doorway=True)
+    assert any(c.kind == "aperture" and c.label == "open doorway"
+               for c in sc.couplings)
+    assert not any(c.kind == "aperture" for c in
+                   presets.make("next_room").couplings)
