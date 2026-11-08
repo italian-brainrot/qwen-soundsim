@@ -256,6 +256,27 @@ def test_the_panes_keep_the_size_you_left_them(qapp, tmp_path):
     shutdown(q)
 
 
+def test_time_strength_is_shown_in_centiseconds_and_d50_in_decibels(win):
+    """AUDIT.md pass 1, finding F5: TS is a *time* (ISO 3382 centiseconds), but
+    the window printed the number with "dB" after it, next to D50 which really is
+    a level -- so the one column read as a level and the other as a time."""
+    class _Result:
+        ir = np.zeros(48_000)
+        sample_rate = 48_000
+        paths = []
+        metrics = {"t60_iso": 0.6, "t60_mid_db": 0.55, "c50": 3.2, "c80": 1.1,
+                   "d50": 62.4, "ts": 27.0, "itdg_ms": 5.2, "total_spl_db": 74.0,
+                   "environment_loss_db": -12.0, "modal_cutoff_hz": 300.0,
+                   "modal_modes_used": 40, "n_paths": 51, "schroeder_mid": 300.0}
+
+    win._refresh_metrics(_Result(), 0.1)
+    ts = win.metric_labels["ts"].text()
+    d50 = win.metric_labels["d50"].text()
+    assert ts.endswith("cs") and "dB" not in ts, f"TS rendered as {ts!r}"
+    assert d50.endswith("dB"), f"D50 rendered as {d50!r}"
+    assert ts.split()[0] == "27.0"
+
+
 def test_the_seek_bar_does_not_move_while_paused(win, tracks):
     """What was seen: pressing pause left the slider sliding along."""
     import numpy as np

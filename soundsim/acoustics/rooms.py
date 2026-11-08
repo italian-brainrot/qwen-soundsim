@@ -180,9 +180,21 @@ def modal_density(f_hz: float, volume_m3, t60: float) -> float:
 def modal_decay_rate(mode, dims, surfaces_by_axis, temp_c: float = 20.0) -> float:
     """Absorption of a single mode (Kuttruff), dB/s.
 
-    Each mode loses energy at a rate set by the wall absorption weighted by the
-    fraction of its energy near each wall: an (n,0,0) axial mode loses
-    ``alpha_x`` per round trip over 2 Lx.
+    A mode ``(n,m,l)`` is a pair of counter-propagating plane waves with
+    wavevector ``(n/Lx, m/Ly, l/Lz)``, so ``(fx,fy,fz)`` below are its direction
+    cosines: it meets the wall pair normal to axis *i* at the rate
+    ``|cos_i| / L_i``, and its loss per second is the direction-cosine-weighted
+    mean dB per wall encounter times the encounter rate.
+
+    This is *not* the Sabine figure and must not be read as one.  An axial mode
+    presses only the two walls it bounces between, so in a uniformly lined room it
+    decays at ``4 A_pair / S`` times the Sabine rate -- about half as fast as
+    Sabine for the 58 Hz mode of a 3 x 3 x 3.2 m stairwell, and slower still for a
+    mode that only presses a small pair of walls.  That is the point of a per-mode
+    decay: Sabine averages over a field that visits every wall equally, and a mode
+    below the Schroeder frequency is not such a field.  (The plane-wave estimate
+    also ignores that a mode's energy density is not uniform along its own axis;
+    the perturbation treatment of that correction is beyond the scope here.)
     """
     lx, ly, lz = dims
     c = speed_of_sound(temp_c)
@@ -203,7 +215,14 @@ def modal_decay_rate(mode, dims, surfaces_by_axis, temp_c: float = 20.0) -> floa
         if a >= 1.0:
             return np.inf
         per_hit += frac * (-10.0 * np.log10(max(1.0 - a, 1e-6)))
-    hits_per_s = f / max((fx * 2 * lx + fy * 2 * ly + fz * 2 * lz) / (fx + fy + fz), 1e-6)
+    # Distance between successive wall encounters for a plane wave in this
+    # direction: the encounter rate is sum_i |cos_i| / L_i, so the mean free path
+    # is its reciprocal.  (The old code divided the *frequency* by a round-trip
+    # length, which has units 1/(s m) -- a decay rate too small by roughly a
+    # wavelength, and one that also missed the factor 2 between a round trip and
+    # the distance between two wall hits.)
+    mean_free_path = 1.0 / max(abs(fx) / lx + abs(fy) / ly + abs(fz) / lz, 1e-9)
+    hits_per_s = c / mean_free_path
     return per_hit * hits_per_s
 
 
@@ -280,7 +299,11 @@ def clarity(c: float, ir: np.ndarray, fs: int) -> float:
 
 
 def definition(ir: np.ndarray, fs: int) -> float:
-    """D50: fraction of energy in the first 50 ms, in dB."""
+    """D50: the ratio of the energy in the first 50 ms to the total, in dB.
+
+    (ISO 3382 also quotes D50 as a plain percentage; this returns the logarithmic
+    value, so -3.01 dB means "half the energy arrives in the first 50 ms".)
+    """
     ir = np.asarray(ir, float)
     n = int(round(0.05 * fs))
     tot = np.sum(ir**2)
@@ -288,14 +311,27 @@ def definition(ir: np.ndarray, fs: int) -> float:
 
 
 def time_strength_cents(ir: np.ndarray, fs: int, db_range=(-10, -25)) -> float:
-    """Time strength TS (centiseconds): centroid of the decay range."""
+    """Time strength TS in *centiseconds* (ISO 3382-1).
+
+    TS is the centroid of the energy in the ``db_range`` (by default -10 to -25 dB)
+    of the backward-integrated decay curve, measured from the 50 ms point where
+    the direct sound and the reverberation are taken to separate::
+
+        TS = (SUM_t t·|h|² / SUM_t |h|²  -  0.050 s) · 100 cs/s
+
+    The unit is the centisecond, and it is a small number: a room that is "too
+    dry" measures below about -20 cs, a very live one above +30 cs.  Reporting
+    the same centroid in milliseconds would be ten times the number every
+    published TS figure uses.
+    """
     ir = np.asarray(ir, float)
     t, db = decay_curve_db(ir, fs)
     m = (db >= db_range[1]) & (db <= db_range[0])
     if m.sum() < 4:
         return float("nan")
     w = ir[m] ** 2
-    return float(np.sum(t[m] * w) / np.sum(w) * 1000.0 - 0.05 * 1000.0)
+    centroid_s = float(np.sum(t[m] * w) / np.sum(w))
+    return (centroid_s - 0.050) * 100.0
 
 
 def early_decay_and_ratios(ir: np.ndarray, fs: int) -> dict[str, float]:
@@ -331,7 +367,7 @@ def band_limited(ir: np.ndarray, fs: int, f_lo: float = 100.0,
     return np.fft.irfft(np.fft.rfft(ir) * w, n=len(ir))
 
 
-def decay_per_band(ir: np.ndarray, fs: int, band_centres, windows=None) -> np.ndarray:
+def decay_per_band(ir: np.ndarray, fs: int, band_centres) -> np.ndarray:
     """T60 measured on each 1/3-octave band, with analyzer-shaped filters.
 
     This is what ISO 3382 prescribes (T60 at 500 Hz, 1 kHz, ...).  A single
@@ -342,6 +378,9 @@ def decay_per_band(ir: np.ndarray, fs: int, band_centres, windows=None) -> np.nd
     octave/third-octave analyser uses.  Brick-wall frequency-domain masks are
     *not* used here: a narrow ideal mask rings for many cycles at low frequency,
     and that ringing is then measured as an absurdly long reverberation time.
+    Which is also why this function takes no band windows: the synthesis band
+    bank is a partition of unity, exactly the brick wall that would corrupt the
+    measurement, and an earlier signature accepted (and ignored) one.
     """
     from scipy.signal import butter, sosfiltfilt
 
@@ -370,12 +409,15 @@ def a_weighting(freqs_hz) -> np.ndarray:
     return 20.0 * np.log10(r / k) + 2.0
 
 
-def spl_from_ir(ir: np.ndarray, fs: int, source_power_w: float | None = None) -> dict[str, float]:
-    """Energy-based level of an impulse response, in dB (relative, and A-weighted).
+def spl_from_ir(ir: np.ndarray, fs: int) -> dict[str, float]:
+    """Energy-based level of an impulse response: dB re 1 (Pa^2 s) and the energy.
 
-    The absolute SPL of a *simulated* field requires the source strength; when
-    ``source_power_w`` is given the receiver mean-square pressure is estimated
-    from the total transmitted energy (see :func:`spherical_spreading`).
+    This is a *relative* figure.  An impulse response carries no absolute sound
+    pressure on its own: the level depends on the source that was played through
+    it, and in this engine that lives in ``Scene.source.spl_at_1m_db`` and in
+    ``renderer.measure`` (which quotes ``total_spl_db`` against the free field of
+    the same source).  A ``source_power_w`` argument used to be accepted here and
+    never used -- so it is gone rather than quietly wrong.
     """
     ir = np.asarray(ir, float)
     e = np.sum(ir**2)

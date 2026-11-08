@@ -609,8 +609,10 @@ class MainWindow(QMainWindow):
         setm["t60_mid"].setText(_fmt(m.get("t60_mid_db")) + " s (400 Hz–2 kHz)")
         setm["c50"].setText(_fmt(m.get("c50")) + " dB")
         setm["c80"].setText(_fmt(m.get("c80")) + " dB")
-        setm["d50"].setText(_fmt(m.get("d50")) + " %")
-        setm["ts"].setText(_fmt(m.get("ts")) + " dB")
+        setm["d50"].setText(_fmt(m.get("d50")) + " dB")
+        # ISO 3382: TS is a centroid measured from 50 ms, in centiseconds -- not a
+        # level, so it is never "dB", and the number is single- or double-digit
+        setm["ts"].setText(_fmt(m.get("ts")) + " cs")
         setm["itdg"].setText(_fmt(m.get("itdg_ms")) + " ms")
         sch = None
         for k, v in m.items():
@@ -1034,7 +1036,7 @@ def _metric_name(key: str) -> str:
         "c50": "C50 clarity",
         "c80": "C80",
         "d50": "D50 definition",
-        "ts": "Ts strength",
+        "ts": "Time strength TS",
         "itdg": "ITDG",
         "schroeder": "Schroeder frequency",
         "modal": "Modal band",

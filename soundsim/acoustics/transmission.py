@@ -129,16 +129,44 @@ def transmission_loss_db(freqs_hz, p: Panel | str, field_incidence: bool = True,
 
 def mass_law_db(freqs_hz, surface_density: float, field_incidence: bool = True,
                 temp_c: float = 20.0) -> np.ndarray:
-    """Analytic mass law, dB.
+    """Transmission loss of a limp sheet of mass, dB -- the analytic mass law.
 
-    Normal incidence:  ``20 log10(m' f) - 47.4 + 5.3``  (the -42.4 form);
-    field incidence (random incidence, the usual building-physics number):
-    ``20 log10(m' f) - 47.4``.
+    With the sheet's reactance normalised to the air, ``Z = w m' / (2 z0)``, the
+    two classical limits follow from the same impedance, exactly:
+
+    normal incidence
+        ``tau = 1 / (1 + Z^2)``, i.e. ``R = 10 log10(1 + Z^2)``, which becomes the
+        familiar ``20 log10 Z`` = ``20 log10(m' f) - 42.5`` once ``Z >> 1``.
+
+    field (diffuse) incidence -- the average this engine uses everywhere, the
+    Beranek integral of the same ``tau(theta) = 1 / (1 + Z^2 cos^2 theta)`` over
+    the hemisphere, which has the closed form
+
+        ``tau_avg = ln(1 + Z^2) / Z^2``,   ``R = 10 log10( Z^2 / ln(1 + Z^2) )``
+
+    Two things worth saying out loud, because the rule of thumb hides them:
+
+    * The diffuse average is *not* the normal-incidence curve minus a constant.
+      Grazing sound gets through a limp mass (``tau -> 1`` as ``cos theta -> 0``),
+      so the deficit ``10 log10(2 ln Z)`` grows slowly with ``m' f``: about 5 dB
+      at a plasterboard wall and about 12 dB at a brick one.
+    * The published building-physics shortcut
+      ``R_field ~ 20 log10(m' f) - 47.4`` is therefore *not* this integral: it is
+      an empirical curve that also absorbs the fact that real partitions are not
+      limp masses at grazing incidence.  At brick it sits ~7 dB above the exact
+      integral, at plasterboard ~2 dB below.  It is quoted here so a reader who
+      knows the shortcut can see where it departs from the maths, not as a target.
     """
     f = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
     z0 = specific_impedance(temp_c)
-    tl_normal = 20.0 * np.log10(np.maximum(f * surface_density / (2.0 * z0 / (2 * np.pi)), 1e-12))
-    return tl_normal - (8.5 if field_incidence else 0.0)
+    z = 2.0 * np.pi * f * float(surface_density) / (2.0 * z0)
+    if not field_incidence:
+        return 10.0 * np.log10(1.0 + z * z)
+    # ln(1+z^2)/z^2 -> 1 as z -> 0: a massless panel transmits everything, and
+    # 10 log10 of that is 0 dB, which is what the limit must give.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tau = np.where(z > 1e-8, np.log1p(z * z) / np.maximum(z * z, 1e-300), 1.0)
+    return -10.0 * np.log10(np.clip(tau, 1e-300, 1.0))
 
 
 # ---------------------------------------------------------------------------

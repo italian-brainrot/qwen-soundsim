@@ -7,7 +7,7 @@ from dataclasses import replace
 import numpy as np
 
 from .bands import BAND_CENTRES
-from .paths import build_paths
+from .paths import PathBuilder, build_paths, source_roll_off
 from .rir import Path, Tail, RenderResult, synthesize
 from .scene import Scene
 from ..acoustics import atmosphere, modal, rooms
@@ -31,8 +31,12 @@ def render(scene: Scene, sample_rate: int = 48_000,
         length = int(min(ir_length_cap_s, _needed_length_s(paths, tails)) * sample_rate)
     res = synthesize(paths, _merge_tails(tails), sample_rate, length=length,
                      band_centres=band_centres, seed=seed)
-    res = remove_subsonic(res, scene)
     res = apply_modal_lowband(res, scene)
+    # ...and *then* strip what cannot be reproduced: the modal model is a rigid
+    # box, and left alone it keeps building bass towards DC (see modal_transfer).
+    # Doing this the other way round let the modal band write back the subsonic
+    # pedestal the filter had just removed.
+    res = remove_subsonic(res, scene)
     res.metrics.update(measure(res, scene))
     return res
 
@@ -54,18 +58,42 @@ def modal_cutoff_hz(scene: Scene) -> float:
     return float(np.clip(2.0 * sch, 60.0, 320.0))
 
 
+#: The frequency below which the render refuses to claim anything: both the
+#: :func:`remove_subsonic` filter and the sub-bass share the window reports use
+#: it.  A room does keep building bass towards DC (the compliance of the air, see
+#: :func:`soundsim.acoustics.modal.modal_transfer`) and a loudspeaker does keep
+#: failing to play it; below this corner the engine is not asked which of the two
+#: it believes.
+SUBSONIC_CORNER_HZ = 15.0
+
+
 def apply_modal_lowband(res: RenderResult, scene: Scene,
                         crossover_octaves: float = 0.6) -> RenderResult:
     """Replace the low-frequency response with the exact modal solution.
 
-    The modal sum gives the *structure* ray methods cannot produce: where the
-    bass peaks and nulls sit, and how long each mode rings.  Its level is
-    anchored to the low-band energy of the path model (which is energy-balance
-    validated), so the two descriptions carry the same energy and the crossfade
-    is inaudible apart from the modal detail it adds.
+    The modal sum gives what ray methods cannot produce: where the bass peaks and
+    nulls sit, how uniform the bass is below the first mode, and how long each
+    mode rings.  It is normalised to the same 1/r scale as the direct sound (see
+    :func:`soundsim.acoustics.modal.modal_transfer`), and its level is then trimmed
+    so the two descriptions agree *where they overlap* -- in the crossover band.
+
+    Matching over the crossover rather than over the whole modal band is the point.
+    Below it the ray model has nothing to say: a room driven below its first
+    eigenfrequency is a compliant volume, not a set of rays, and its bass level is
+    exactly the thing the modal model is here to add.  Matching total energies
+    instead would hand the whole budget to the bottom octave -- where the room is
+    loudest and the loudspeaker is silent -- and scale the audible modal detail to
+    nothing.
 
     Only the FFT bins below the crossover are evaluated -- both for speed and to
-    keep the memory footprint flat.
+    keep the memory footprint flat.  Every one of them belongs to the modal model,
+    down to DC: the ray model has nothing true to say inside a box below its first
+    eigenfrequency, and leaving the bottom octave to it leaves a sub-audible
+    pedestal that the subsonic filter then rings.  What keeps that region honest is
+    the pair the source and the room make: the box's compliance rises at 12 dB per
+    octave towards DC, the loudspeaker falls at 12 dB per octave below its own f3,
+    and :func:`soundsim.acoustics.modal.modal_transfer` returns 0 for the DC bin.
+    :func:`remove_subsonic` runs after this and strips what is left.
     """
     f_x = modal_cutoff_hz(scene)
     if f_x <= 0:
@@ -96,10 +124,19 @@ def apply_modal_lowband(res: RenderResult, scene: Scene,
                                  room.local(scene.receiver), freqs[mask], axes,
                                  temp_c=scene.weather.temp_c, f_max=f_max)
     h_low = h_low * 10.0 ** ((scene.source.spl_at_1m_db - 94.0) / 20.0)
+    # The source is part of the chain everywhere else (paths._apply_source_response),
+    # and the modal band is anchored to path-model energy: comparing a room driven
+    # by an ideal source against one driven by a box that cannot play below f3 puts
+    # the anchor's whole budget into the bottom octave, where the loudspeaker is
+    # silent.  Same filter, same bins.
+    h_low = h_low * source_roll_off(freqs[mask], scene.source.f3_db)
 
     spec = np.fft.rfft(ir)
-    e_paths = float(np.sum(np.abs(spec[mask] * x_lo[mask]) ** 2))
-    e_modal = float(np.sum(np.abs(h_low * x_lo[mask]) ** 2))
+    # the trim is measured where both models are speaking: x_lo * x_hi peaks in the
+    # middle of the crossover and vanishes at both ends
+    w_anchor = x_lo[mask] * x_hi[mask]
+    e_paths = float(np.sum(np.abs(spec[mask]) ** 2 * w_anchor))
+    e_modal = float(np.sum(np.abs(h_low) ** 2 * w_anchor))
     if e_paths > 0 and e_modal > 0:
         h_low = h_low * np.sqrt(e_paths / e_modal)
     spec[mask] = spec[mask] * x_hi[mask] + h_low * x_lo[mask]
@@ -157,23 +194,31 @@ def render_pair(scene: Scene, sample_rate: int = 48_000,
     return irs, first
 
 
-def remove_subsonic(res: RenderResult, scene: Scene, f_lo: float = 15.0):
+def remove_subsonic(res: RenderResult, scene: Scene, f_lo: float = SUBSONIC_CORNER_HZ):
     """Strip energy below audibility from the synthesised response.
 
     A 1/3-octave band centred at 25 Hz cannot be represented honestly in a
     response only a few cycles long: the burst's spectrum smears down to DC, and
     that fake sub-10 Hz content is precisely what makes a small speaker's cone
     pump and the output distort.  Nothing audible is touched -- 15 Hz is two
-    octaves below the lowest note most people can hear on speakers -- and the
-    metrics (T60, C50, band balance) are unchanged to within a few thousandths
-    of a dB.
-    """
-    from scipy.signal import butter, sosfiltfilt
+    octaves below the lowest note most people can hear on speakers.
 
+    The filter is a 2nd-order Butterworth magnitude, applied zero-phase in the
+    frequency domain, which is what ``sosfiltfilt`` of the same corner would do to
+    an infinitely long signal.  It is *not* applied as an IIR: filtfilt's default
+    edge padding is a handful of samples, far too short for the transient of a
+    15 Hz section to decay, so it rings a burst at the corner into the response --
+    measured on the car cabin, that transient put 9 dB more energy in the 15-20 Hz
+    band than the response had before filtering.  A filter meant to take sub-bass
+    out must not put any in.
+    """
     if res.sample_rate / 2.0 <= f_lo:
         return res
-    sos = butter(2, f_lo / (res.sample_rate / 2.0), btype="high", output="sos")
-    res.ir = sosfiltfilt(sos, res.ir)
+    f = np.fft.rfftfreq(len(res.ir), 1.0 / res.sample_rate)
+    gain = np.zeros_like(f)
+    nz = f > 0.0
+    gain[nz] = 1.0 / np.sqrt(1.0 + (f_lo / f[nz]) ** 4)
+    res.ir = np.fft.irfft(np.fft.rfft(res.ir) * gain, n=len(res.ir))
     return res
 
 
@@ -228,12 +273,12 @@ def measure(res: RenderResult, scene: Scene) -> dict:
     out = early_decay_and_ratios(ir, fs)
     out["t60_iso"] = rooms.t60(ir_iso, fs)
     # per-band T60 measured on the response (ISO 3382 style), so it can be
-    # compared with the analytic Sabine figure band by band
-    from ..engine.bands import band_windows
-    freqs = np.fft.rfftfreq(len(ir), 1.0 / fs)
-    wins = band_windows(freqs, res.band_centres)
+    # compared with the analytic Sabine figure band by band.  The analyser is the
+    # one rooms.decay_per_band builds itself: the synthesis band bank is a
+    # partition of unity, and a brick-wall mask of that shape rings for far too
+    # long at low frequency to be a decay measurement.
     t_bands = rooms.decay_per_band(rooms.band_limited(ir, fs, 60.0, 8000.0), fs,
-                                   res.band_centres, wins)
+                                   res.band_centres)
     out["t60_bands"] = t_bands
     out["t60_bands_hz"] = res.band_centres
     # single-number rating: mid-band average, the way ISO 3382 describes a room.
@@ -250,7 +295,6 @@ def measure(res: RenderResult, scene: Scene) -> dict:
     # Free-field reference: what the receiver would get with nothing in between
     # (same distance, same air absorption).  All level figures below are relative
     # to that, which is what "how much does this environment cut the sound" means.
-    from .paths import PathBuilder
     pb = PathBuilder(scene, res.band_centres)
     d = float(np.linalg.norm(np.asarray(scene.receiver, float)
                              - np.asarray(scene.source.position, float)))
@@ -277,11 +321,18 @@ def measure(res: RenderResult, scene: Scene) -> dict:
     # "that sounds far away" actually consists of.
     band = np.asarray(res.band_centres, dtype=np.float64)
     acc = np.zeros(len(band), dtype=np.complex128)
+    e_dec = np.zeros(len(band))
     t0 = min((p.delay_s for p in res.paths), default=0.0)
     for p in res.paths:
+        if not p.coherent:
+            # no phase relation to the rest: it belongs in the energy column, and
+            # putting it in the pressure sum would rebuild the very interference
+            # the turbulence knob is there to remove
+            e_dec = e_dec + np.abs(p.gains) ** 2
+            continue
         extra = np.zeros(len(band)) if p.delay_bands is None else p.delay_bands
         acc = acc + p.gains * np.exp(-2.0j * np.pi * band * ((p.delay_s + extra) - t0))
-    e_paths = np.abs(acc) ** 2
+    e_paths = np.abs(acc) ** 2 + e_dec
     for t in (res.tail and [res.tail] or []):
         e_paths = e_paths + t.energy
     # the paths already carry the source's calibration (spl_at_1m_db), so the

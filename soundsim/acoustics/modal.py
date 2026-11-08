@@ -11,17 +11,26 @@ small bedroom.
 
 The Green's function of a rigid-walled box is
 
-    G(r, r_s; k) = SUM_n  phi_n(r) phi_n(r_s) / (k_n^2 - k^2 + j k_n^2 / Q_n)
+    G(r, r_s; k) = SUM_n  phi_n(r) phi_n(r_s) / (k_n^2 - k^2 + j k sigma_n / c)
 
-with the Rayleigh modes ``k_n = pi (n_x/Lx, n_y/Ly, n_z/Lz)`` and the orthonormal
-shapes ``phi_n = prod cos(n_i pi x_i / L_i)`` (norm 1/V per axis, 2 for the
+summed over *every* eigenmode, including the uniform one at ``k_0 = 0`` whose
+wavenumbers are ``k_n = pi (n_x/Lx, n_y/Ly, n_z/Lz)`` and whose shapes are the
+orthonormal ``phi_n = prod cos(n_i pi x_i / L_i)`` (norm 1/V per axis, 2 for the
 non-zero indices).  Since ``(laplacian + k^2) G = -delta``, a source whose
 free-field pressure at 1 m is 1 Pa has volume velocity ``q = 4 pi / (rho0 w)``,
 and then
 
-    H(k) = j w rho0 q G = j 4 pi G      ->      |H| -> 1/r   in free field
+    H(k) = w rho0 q G / j = 4 pi G      ->      |H| -> 1/r   in free field
 
-so the modal sum is automatically on the same scale as the 1/r direct sound.
+so the modal sum is automatically on the same scale as the 1/r direct sound.  No
+extra factor of ``j``: dropping a ``1/j`` somewhere on the way and putting it
+back at the end rotates the whole response by 90 deg, which makes the spectrum
+anti-Hermitian -- and the inverse real FFT used to synthesise it silently throws
+half of it away.
+
+The uniform mode is not an oscillation, so :func:`modal_frequencies` drops it,
+but it is the term that carries the bass of a closed box and it is added back
+explicitly -- see the note in :func:`modal_transfer`.
 
 Modal damping uses the mode's own wall absorption: a mode "sees" the walls it
 presses hardest, weighted by its direction cosines, giving a per-mode Q and hence
@@ -55,6 +64,9 @@ def modal_frequencies(dims, f_max: float, temp_c: float = 20.0):
     idx = np.stack([g.ravel() for g in grid], axis=1)
     k = np.pi * np.linalg.norm(idx / dims[None, :], axis=1)
     f = c * k / (2.0 * np.pi)
+    # (0,0,0) is dropped: it does not oscillate, and a generic mode list is used
+    # for peak counts and mode shapes, where a division by k_n = 0 is meaningless.
+    # modal_transfer() adds its physics back -- see the compliance term there.
     keep = f > 1e-6
     return idx[keep], f[keep]
 
@@ -100,15 +112,48 @@ def modal_transfer(dims, src, dst, freqs_hz, alpha_by_axis,
     """Complex transfer function (same 1/r free-field normalisation as the paths).
 
     Convergence: a plain modal sum is useless when truncated (its terms fall only
-    as ``1/k_n^2``), so the free-field Green's function is added and subtracted
-    (Krenk / Rayleigh subtraction)::
+    as ``1/k_n^2``), so the free-field Green's function is added and the static
+    part of each mode subtracted (Krenk / Rayleigh subtraction)::
 
-        G = G_free + SUM phi_n phi_n [1/(k_n^2 - k^2 + j k sigma_n/c) - 1/k_n^2]
+        G = G_free + SUM_{n != 0} phi_n phi_n [1/(k_n^2 - k^2 + j k sigma_n/c)
+                                               - 1/k_n^2]
+            + (1/V) / (-k^2 + j k sigma_0/c)                      # uniform mode
 
-    the bracket now falling like ``k^2/k_n^4``, and vanishing identically at
-    ``k -> 0`` so the exact DC limit is kept.  ``alpha_by_axis[axis]`` is an
-    absorber (or a callable freq -> alpha) for the two walls normal to that axis,
-    evaluated at each mode's frequency.
+    The bracket now falls like ``k^2 / k_n^4``, which is what makes the truncated
+    sum usable at all.  It is *not* the whole low-frequency story, and the last
+    term is the part that used to be missing.  Splitting the exact term as
+    ``1/(k_n^2 - k^2) = 1/k_n^2 + k^2 / (k_n^2 (k_n^2 - k^2))`` shows that what
+    the subtraction removes has to be added back: it is the box's **static**
+    Green's function, of which
+
+    * ``(1/V)/(-k^2 + j k sigma_0/c)`` is the uniform (0,0,0) mode -- the
+      compliance of the air.  Below the first eigenfrequency the wavelength is
+      several times the room, the air moves as one lump, and the pressure is set
+      by the stiffness of the whole volume: it grows towards DC and it is the
+      same in every corner.  That is the bass of a closed box, and it is the
+      opposite of what a sum that starts at ``n != 0`` converges to, which is
+      ``G_free``: without this term the model reports the free field inside a
+      sealed wall, i.e. 20 dB of seat-to-seat variation where the real room has
+      a nearly uniform hum.  It decays at the Sabine rate ``sigma_0 = c a S/4V``,
+      since a uniform pressure loads every wall equally.
+    * ``SUM_{n != 0} phi_n phi_n / k_n^2`` is the static field of the box's image
+      sources.  Part of it is the ``k -> 0`` limit of ``G_free`` (already there);
+      the remainder is a smooth, position-dependent correction that a truncated
+      sum cannot recover on its own.  It is *not* computed here: it needs a
+      conditionally convergent static lattice sum.  It is the known limitation of
+      this model, and the range where it matters is narrow -- far below the first
+      mode the compliance term is ~30 dB larger, and near the modes the mode
+      terms are.
+
+    ``alpha_by_axis[axis]`` is an absorber (or a callable freq -> alpha) for the
+    two walls normal to that axis, evaluated at each mode's frequency.
+
+    DC: the box response diverges as ``k -> 0`` for a source that holds its
+    *volume velocity* fixed to DC (a rigid box is a spring, and a spring driven at
+    zero frequency has no finite answer).  Bin 0 of a spectrum is the mean of the
+    response, and a room's pressure record has no mean, so the DC bin is returned
+    as 0 -- stated here rather than left for ``irfft`` to decide by keeping the
+    real part of whatever arrives.
     """
     c = speed_of_sound(temp_c)
     f = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
@@ -140,8 +185,21 @@ def modal_transfer(dims, src, dst, freqs_hz, alpha_by_axis,
         correction += np.sum(coupling[None, sl] * (1.0 / denom - 1.0 / k_n[None, sl] ** 2),
                              axis=1)
 
+    # ---- the uniform (0,0,0) mode: the compliance of the air ----------------
+    # phi_0 = 1/sqrt(V) everywhere, k_0 = 0, so its term is (1/V)/(-k^2 + j k
+    # sigma_0/c): spatially uniform, growing as 1/f towards DC.  sigma_0 is the
+    # Sabine rate -- a uniform pressure loads all six walls equally.
+    f_low = float(f_n[0]) if len(f_n) else 20.0     # the lowest absorption available
+    axes_alpha = [_alpha_of(alpha_by_axis[axis], [f_low]) for axis in range(3)]
+    areas = _axis_areas(dims)
+    a_0 = float(np.dot([a[0] for a in axes_alpha], areas) / max(areas.sum(), 1e-9))
+    sigma_0 = c * np.clip(a_0, 1e-4, 1.0) * float(areas.sum()) / (4.0 * v)
+    compliance = np.zeros(len(f), dtype=np.complex128)
+    nz = k > 0.0                       # DC: see the docstring
+    compliance[nz] = (1.0 / v) / (-k[nz] ** 2 + 1j * k[nz] * sigma_0 / c)
+
     g_free = np.exp(-1j * k * r) / (4.0 * np.pi * r)
-    return 1j * 4.0 * np.pi * (g_free + correction)
+    return 4.0 * np.pi * (g_free + correction + compliance)
 
 
 def _axis_areas(dims) -> np.ndarray:

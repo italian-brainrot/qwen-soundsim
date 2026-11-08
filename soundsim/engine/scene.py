@@ -132,44 +132,97 @@ class Reflector:
 
 @dataclass
 class Barrier:
-    """A finite screen: a vertical quad with a straight top edge.
+    """A finite screen: a vertical rectangle with a straight, horizontal top.
 
-    Diffraction goes over the top edge (the dominant path in the shadow zone);
-    the screen's thickness is modelled by two edges, as in ISO 9613-2.
+    Diffraction goes over the top edge -- the dominant path in the shadow zone.
+    Two geometric details are modelled, because both are heard:
+
+    * ``width`` is the horizontal extent along ``along``.  The diffracting point
+      is the shortest source->edge->receiver route restricted to the *finite*
+      top edge, so a ray that would pass beside the end of the screen is
+      diffracted *around that end*, with the much larger path excess that
+      implies: a 2 m screen shields a lot less than a 40 m one.
+    * ``thickness`` is the width of a flat top.  A top of finite width has two
+      edges, near and far, and both diffract; the engine sums the two edge
+      contributions in energy (``diffraction.edge_group_attenuation_db``).
+      With ``thickness = 0`` the two edges coincide and only one is returned.
     """
     center: Vector               # centre of the screen (x, y at ground level, z = 0)
     width: float                 # horizontal extent of the screen
     height: float                # top edge height, m
     along: Vector = (1.0, 0.0, 0.0)   # direction of the screen's length in plan
     name: str = "barrier"
+    thickness: float = 0.0       # width of a flat top, m (0 = a zero-thickness screen)
 
-    def top_edges(self) -> tuple[tuple[Vector, Vector], tuple[Vector, Vector]]:
-        """Return the near and far top edges as (point, direction) pairs."""
+    # -- geometry -------------------------------------------------------
+    def _frame(self):
+        """Unit length direction, plan normal, and the two top-edge centres."""
         c = np.asarray(self.center, float)
         d = np.asarray(self.along, float)
-        d = d / np.linalg.norm(d)
+        d = d / max(np.linalg.norm(d), 1e-12)
         n = np.array([-d[1], d[0], 0.0])          # screen normal (in plan)
         top = c + np.array([0.0, 0.0, self.height])
-        return ((top, tuple(d)), (top, tuple(d)))
+        half = 0.5 * max(float(self.thickness), 0.0)
+        return d, n, (top - n * half, top + n * half)
+
+    def top_edges(self) -> tuple[tuple[Vector, Vector], ...]:
+        """The top edge(s) as ``(point, direction)`` pairs, near side first.
+
+        One entry for a thin screen, two when the top has a ``thickness``.
+        """
+        d, n, (near, far) = self._frame()
+        if self.thickness <= 0.0:
+            return ((tuple(near), tuple(d)),)
+        return ((tuple(near), tuple(d)), (tuple(far), tuple(d)))
 
     def edge_points(self, source, receiver) -> list[np.ndarray]:
-        """Point(s) on the top edge that the diffracted ray passes through.
+        """Point(s) on the top edge(s) that the diffracted ray passes through.
 
-        The shortest source->edge->receiver path over a straight top edge is
-        found by projecting onto the edge line (Fermat).
+        The shortest source->edge->receiver path over each (finite) top edge,
+        found by scanning the edge line between its ends (Fermat).  Clamping to
+        the ends is what makes ``width`` matter: the minimiser runs off to an end
+        as soon as the straight-line route would miss the screen.
         """
         s = np.asarray(source, float)
         r = np.asarray(receiver, float)
-        top_c, top_dir = self.top_edges()[0]
-        p0 = np.asarray(top_c, float)
-        d = np.asarray(top_dir, float)
-        d = d / np.linalg.norm(d)
-        # minimise |s-(p0+t d)| + |r-(p0+t d)| over t  (golden section on a line)
-        ts = np.linspace(-40.0, 40.0, 4001)
-        cost = (np.linalg.norm(s - (p0[None, :] + ts[:, None] * d[None, :]), axis=1)
-                + np.linalg.norm(r - (p0[None, :] + ts[:, None] * d[None, :]), axis=1))
-        t = ts[int(np.argmin(cost))]
-        return [p0 + t * d]
+        d, n, _ = self._frame()
+        half = max(0.5 * float(self.width), 0.0)
+        out = []
+        for top_c, _dir in self.top_edges():
+            p0 = np.asarray(top_c, float)
+            ts = np.linspace(-half, half, 401)
+            pts = p0[None, :] + ts[:, None] * d[None, :]
+            cost = (np.linalg.norm(s - pts, axis=1)
+                    + np.linalg.norm(r - pts, axis=1))
+            out.append(pts[int(np.argmin(cost))])
+        return out
+
+    def blocks(self, source, receiver) -> bool:
+        """True when the straight source->receiver ray hits the screen's rectangle.
+
+        The test is exact for a vertical rectangle: the plan projection of the
+        ray has to cross the screen's plan trace *within its width*, and at that
+        crossing the ray has to be lower than the top.  Everything else is the
+        light zone, where a screen costs nothing however tall it looks in a
+        drawing -- see ``diffraction.maekawa_attenuation_db``.
+        """
+        s = np.asarray(source, float)
+        r = np.asarray(receiver, float)
+        d, n, (top_c, _) = self._frame()
+        half = max(0.5 * float(self.width), 0.0)
+        # solve  a + t b = u d  in plan, with a = s - top_centre, b = r - s
+        # (crossing the equation with d and with b respectively)
+        a2 = s[:2] - top_c[:2]
+        b2 = (r - s)[:2]
+        cross = lambda x, y: x[0] * y[1] - x[1] * y[0]
+        den = cross(b2, d)
+        if abs(den) < 1e-12:
+            return False                                   # ray runs along the screen
+        t = -cross(a2, d) / den                            # where along the ray
+        u = -cross(a2, b2) / den                           # where along the screen
+        if not 0.0 <= t <= 1.0 or abs(u) > half:
+            return False                                   # misses the rectangle in plan
+        return s[2] + t * (r[2] - s[2]) < self.height      # and passes under the top
 
 
 @dataclass
@@ -211,9 +264,13 @@ class Source:
     #: -3 dB point of the source's own low-frequency response.  A real box
     #: cannot radiate much below its box/ports resonance, and that matters here:
     #: the lowest room modes are exactly what a flat-spectrum source would
-    #: over-excite.  4th-order (12 dB per octave each side of the corner is a
-    #: 2nd-order high pass, doubled for the velocity+response behaviour of a
-    #: sealed box).
+    #: over-excite.  Modelled as a 2nd-order high pass in pressure -- 12 dB per
+    #: octave below f3, which is what a sealed box below its resonance does (the
+    #: cone's excursion stays put, its velocity, and hence its volume velocity,
+    #: falls at 6 dB per octave, and radiation costs another 6 dB).
+    #: That slope is not incidental: the compliance of a closed room rises at
+    #: exactly 12 dB per octave towards DC (acoustics.modal), so the two are the
+    #: pair that keeps a rendered cabin from running away into inaudible bass.
     f3_db: float = 55.0
 
 
